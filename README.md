@@ -58,5 +58,6 @@ npm test        # a fake API, a fake destination, curl as the client
 docker build -t credential-gateway .
 ```
 
-MIT licensed. The briq service is operated by Uplab SAS under its
+This repo is written by each release from briq's source tree; changes are made there and land
+here with the image. MIT licensed. The briq service is operated by Uplab SAS under its
 [terms](https://briq.cloud/legal/terms).

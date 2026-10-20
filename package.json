@@ -1,8 +1,8 @@
 {
-  "name": "@briq-cloud/credential-gateway",
+  "name": "@briq/credential-gateway",
   "version": "0.1.0",
   "private": true,
-  "description": "briq's credential gateway: the proxy a team's briqs reach the internet through, which swaps placeholders for real secrets on the way out and never lets a secret in.",
+  "description": "The credential gateway: the proxy a team's briqs reach the internet through, which swaps placeholders for real secrets on the way out and never lets a secret in.",
   "license": "MIT",
   "type": "module",
   "engines": { "node": ">=22" },
