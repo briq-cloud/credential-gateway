@@ -63,6 +63,8 @@ export class Config {
     this.briqByIp = new Map();
     /** @type {Map<string, Set<string>>} briq id → the names of the team secrets its env names */
     this.secretsByBriq = new Map();
+    /** @type {Map<string, any[]>} briq id → its own secrets with hosts (same shape as a team's) */
+    this.ownByBriq = new Map();
     this.lastRefreshAt = 0;
     this.timer = null;
   }
@@ -71,6 +73,7 @@ export class Config {
     const c = await this.api.config();
     this.secrets = c.secrets ?? [];
     this.secretsByBriq = new Map((c.briqs ?? []).map((b) => [b.id, new Set(b.secrets ?? [])]));
+    this.ownByBriq = new Map((c.briqs ?? []).map((b) => [b.id, b.own ?? []]));
     this.lastRefreshAt = Date.now();
     if (this.resolve6) {
       const byIp = new Map();
@@ -118,9 +121,11 @@ export class Config {
   forHost(host, briqId) {
     const named = briqId ? this.secretsByBriq.get(briqId) : undefined;
     if (!named) return [];
-    return this.secrets.filter(
-      (s) => named.has(s.name) && (s.hosts ?? []).some((p) => hostMatches(p, host)),
-    );
+    const forThisHost = (s) => (s.hosts ?? []).some((p) => hostMatches(p, host));
+    return [
+      ...this.secrets.filter((s) => named.has(s.name) && forThisHost(s)),
+      ...(this.ownByBriq.get(briqId) ?? []).filter(forThisHost),
+    ];
   }
 
   /** Which briq an address belongs to, when the API told us about it. */

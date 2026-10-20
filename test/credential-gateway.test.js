@@ -19,6 +19,8 @@ const PLACEHOLDER = 'briq_secret_a1b2c3d4e5f6a7b8';
 const BODY_SECRET = 'body-secret-VALUE-9876543210';
 const BODY_PLACEHOLDER = 'briq_secret_ffffffffeeeeeeee';
 const OTHER_PLACEHOLDER = 'briq_secret_0000000011111111';
+const OWN_SECRET = 'own-secret-VALUE-5555555555';
+const OWN_PLACEHOLDER = 'briq_secret_abcdefabcdefabcd';
 
 describe('hostMatches', () => {
   it('matches exact hosts and wildcard subdomains', () => {
@@ -115,7 +117,23 @@ describe('the gateway', () => {
                   locations: ['header'],
                 },
               ],
-              briqs: [{ id: 'bq_test', host: 'localhost', secrets: ['TOKEN', 'BODY'] }],
+              briqs: [
+                {
+                  id: 'bq_test',
+                  host: 'localhost',
+                  secrets: ['TOKEN', 'BODY'],
+                  // The briq's own secret with hosts: its value, for it alone.
+                  own: [
+                    {
+                      name: 'OWN',
+                      placeholder: OWN_PLACEHOLDER,
+                      value: OWN_SECRET,
+                      hosts: ['localhost'],
+                      locations: ['header'],
+                    },
+                  ],
+                },
+              ],
             }),
           );
         } else if (req.method === 'POST' && req.url === '/internal/credential-gateway/events') {
@@ -199,6 +217,22 @@ describe('the gateway', () => {
     ]);
     assert.equal(received.length, 1);
     assert.equal(received[0].headers.authorization, `Bearer ${OTHER_PLACEHOLDER}`);
+  });
+
+  it("puts in the briq's own secret with hosts, and scrubs it from the response", async () => {
+    received.length = 0;
+    const out = await curl([
+      '--cacert',
+      join(dir, 'ca.pem'),
+      '-H',
+      `Authorization: Bearer ${OWN_PLACEHOLDER}`,
+      '-D',
+      '-',
+      'https://localhost:443/own',
+    ]);
+    assert.equal(received[0].headers.authorization, `Bearer ${OWN_SECRET}`);
+    assert.ok(out.includes(`x-echo-auth: Bearer ${OWN_PLACEHOLDER}`), out);
+    assert.ok(!out.includes(OWN_SECRET), 'the real value reached the client');
   });
 
   it('substitutes in the body only for a secret that allows it', async () => {
