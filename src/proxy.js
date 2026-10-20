@@ -9,6 +9,7 @@ import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import tls from 'node:tls';
+import zlib from 'node:zlib';
 
 /** Hop-by-hop headers, never forwarded. */
 const HOP = new Set([
@@ -145,7 +146,21 @@ export function createProxy({ config, leafs, events, log }, opts = {}) {
 
   /** One request to an intercepted host. */
   async function handle(req, res, host, port, secrets, briqId) {
-    let headers = forwardHeaders(req.rawHeaders, req.headers.host ?? host);
+    // The request must address the CONNECT host: a Host naming another site on the same address
+    // (a shared CDN) would carry the real value there. An absolute-form target is refused too.
+    const reqHost = (req.headers.host ?? '').replace(/:\d+$/, '').toLowerCase();
+    if (
+      (reqHost && reqHost !== host.toLowerCase()) ||
+      /^[a-z][a-z0-9+.-]*:\/\//i.test(req.url ?? '')
+    ) {
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      res.end(`briq credential gateway: the request must address ${host}\n`);
+      return;
+    }
+    let headers = forwardHeaders(req.rawHeaders, host);
+    // Scrubbing reads the response as text: ask for it uncompressed.
+    headers = without(headers, ['accept-encoding']);
+    headers['accept-encoding'] = 'identity';
     const used = new Set();
     // Headers: every secret that allows them.
     for (const [name, value] of Object.entries(headers)) {
@@ -216,18 +231,52 @@ export function createProxy({ config, leafs, events, log }, opts = {}) {
       upRes.pipe(res);
       return;
     }
-    const scrubbed = out.buffer
-      ? used.size
-        ? Buffer.from(scrub(out.buffer.toString('latin1')), 'latin1')
-        : out.buffer
-      : Buffer.alloc(0);
-    const finalHeaders = without(resHeaders, ['content-length']);
+    let resBody = out.buffer ?? Buffer.alloc(0);
+    let finalHeaders = without(resHeaders, ['content-length']);
+    const encoding = String(upRes.headers['content-encoding'] ?? 'identity').toLowerCase();
+    if (used.size && resBody.length && encoding !== 'identity') {
+      // Asked for none, got a compressed body: read it to scrub it, or refuse it. A real value
+      // never goes on unread.
+      try {
+        resBody = decompress(encoding, resBody);
+        finalHeaders = without(finalHeaders, ['content-encoding']);
+      } catch {
+        res.writeHead(502, { 'content-type': 'text/plain' });
+        res.end(
+          `briq credential gateway: a ${encoding} response from ${host} could not be read to scrub it\n`,
+        );
+        return;
+      }
+    }
+    const scrubbed = used.size ? Buffer.from(scrub(resBody.toString('latin1')), 'latin1') : resBody;
     finalHeaders['content-length'] = String(scrubbed.length);
     res.writeHead(status, finalHeaders);
     res.end(scrubbed);
   }
 
   return server;
+}
+
+/** A compressed body, readable: one encoding, the ones Node knows. */
+function decompress(encoding, buf) {
+  switch (encoding) {
+    case 'gzip':
+    case 'x-gzip':
+      return zlib.gunzipSync(buf);
+    case 'deflate':
+      try {
+        return zlib.inflateSync(buf);
+      } catch {
+        return zlib.inflateRawSync(buf);
+      }
+    case 'br':
+      return zlib.brotliDecompressSync(buf);
+    case 'zstd':
+      if (typeof zlib.zstdDecompressSync === 'function') return zlib.zstdDecompressSync(buf);
+      throw new Error('zstd is not available');
+    default:
+      throw new Error(`unknown content-encoding ${encoding}`);
+  }
 }
 
 /** `obj` without the keys named, compared without case: header names come in either. */

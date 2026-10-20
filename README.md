@@ -18,14 +18,15 @@ this repo is here so you can read what sits between your sandbox and the interne
 - **CONNECT to a host one of the team's secrets allows** (port 443): the gateway answers the TLS
   handshake with a certificate from its own CA, reads each request, replaces every placeholder
   with the real value where the secret allows it (request headers; the body too when the secret
-  says so), and sends the request on over its own TLS connection to the real host. In the
-  response, the real value, if the host echoes it, becomes the placeholder again, in headers and
-  body.
+  says so), and sends the request on over its own TLS connection to the real host, asking for an
+  uncompressed answer. In the response, the real value, if the host echoes it, becomes the
+  placeholder again, in headers and body; a compressed answer is decompressed first, or refused.
+  The request must address the CONNECT host: a `Host` naming another site is refused.
 - **CONNECT to any other host**: a tunnel, byte for byte. The gateway sees nothing of it.
 - **Plain HTTP through the proxy**: forwarded as it is, never injected. A real value in clear is
   not something it sends.
-- **Reports** to the briq API which briq used which secret against which host, batched per
-  minute: that is the team's audit log.
+- **Reports** to the briq API which briq used which secret against which host and method,
+  batched per minute: that is the team's audit log.
 
 The CA is made on the gateway's first boot and kept on its volume; its private key never leaves
 the machine. The API only ever gets the certificate.

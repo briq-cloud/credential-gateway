@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { promisify } from 'node:util';
+import { gzipSync } from 'node:zlib';
 import { LeafCerts, loadOrCreateCa } from '../src/ca.js';
 import { Api, Config, Events, hostMatches, normalizeIp } from '../src/config.js';
 import { createProxy } from '../src/proxy.js';
@@ -57,7 +58,12 @@ describe('the gateway', () => {
         received.push({ method: req.method, url: req.url, headers: req.headers, body });
         res.setHeader('x-echo-auth', req.headers.authorization ?? '');
         res.setHeader('content-type', 'application/json');
-        res.end(JSON.stringify({ auth: req.headers.authorization ?? null, body }));
+        const payload = JSON.stringify({ auth: req.headers.authorization ?? null, body });
+        // A server that compresses whatever the client asked for.
+        if (req.headers['x-test-gzip']) {
+          res.setHeader('content-encoding', 'gzip');
+          res.end(gzipSync(payload));
+        } else res.end(payload);
       });
     });
     await new Promise((r) => destination.listen(0, '127.0.0.1', r));
@@ -191,6 +197,46 @@ describe('the gateway', () => {
     assert.equal(body.a, PLACEHOLDER, 'a header-only secret is never put in a body');
     assert.equal(body.b, BODY_SECRET);
     assert.equal(received[0].headers['content-length'], String(received[0].body.length));
+  });
+
+  it('asks for an uncompressed response, and reads one that comes compressed anyway', async () => {
+    received.length = 0;
+    const out = await curl([
+      '--cacert',
+      join(dir, 'ca.pem'),
+      '--compressed',
+      '-H',
+      `Authorization: Bearer ${PLACEHOLDER}`,
+      '-H',
+      'x-test-gzip: 1',
+      '-D',
+      '-',
+      'https://localhost:443/gz',
+    ]);
+    assert.equal(received[0].headers['accept-encoding'], 'identity');
+    // Decompressed, scrubbed, sent on plain.
+    assert.ok(out.includes(`"auth":"Bearer ${PLACEHOLDER}"`), out);
+    assert.ok(!out.includes(SECRET), 'the real value reached the client in a compressed body');
+    assert.ok(!/content-encoding/i.test(out), out);
+  });
+
+  it('refuses a request whose Host is not the CONNECT host', async () => {
+    received.length = 0;
+    const out = await curl([
+      '--cacert',
+      join(dir, 'ca.pem'),
+      '-H',
+      'Host: other.example',
+      '-H',
+      `Authorization: Bearer ${PLACEHOLDER}`,
+      '-o',
+      '/dev/null',
+      '-w',
+      '%{http_code}',
+      'https://localhost:443/x',
+    ]);
+    assert.equal(out, '400');
+    assert.equal(received.length, 0, 'the destination was reached');
   });
 
   it('tunnels a host no secret allows, without touching the bytes', async () => {
