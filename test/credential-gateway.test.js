@@ -18,6 +18,7 @@ const SECRET = 'real-secret-VALUE-0123456789';
 const PLACEHOLDER = 'briq_secret_a1b2c3d4e5f6a7b8';
 const BODY_SECRET = 'body-secret-VALUE-9876543210';
 const BODY_PLACEHOLDER = 'briq_secret_ffffffffeeeeeeee';
+const OTHER_PLACEHOLDER = 'briq_secret_0000000011111111';
 
 describe('hostMatches', () => {
   it('matches exact hosts and wildcard subdomains', () => {
@@ -105,8 +106,16 @@ describe('the gateway', () => {
                   hosts: ['localhost'],
                   locations: ['header', 'body'],
                 },
+                // A team secret for the same host that the test briq did not name.
+                {
+                  name: 'OTHER',
+                  placeholder: OTHER_PLACEHOLDER,
+                  value: 'other-secret-VALUE',
+                  hosts: ['localhost'],
+                  locations: ['header'],
+                },
               ],
-              briqs: [{ id: 'bq_test', host: 'localhost' }],
+              briqs: [{ id: 'bq_test', host: 'localhost', secrets: ['TOKEN', 'BODY'] }],
             }),
           );
         } else if (req.method === 'POST' && req.url === '/internal/credential-gateway/events') {
@@ -177,6 +186,19 @@ describe('the gateway', () => {
     assert.ok(out.includes(`x-echo-auth: Bearer ${PLACEHOLDER}`), out);
     assert.ok(out.includes(`"auth":"Bearer ${PLACEHOLDER}"`), out);
     assert.ok(!out.includes(SECRET), 'the real value reached the client');
+  });
+
+  it('puts in only the secrets the briq named: another placeholder passes through as text', async () => {
+    received.length = 0;
+    await curl([
+      '--cacert',
+      join(dir, 'ca.pem'),
+      '-H',
+      `Authorization: Bearer ${OTHER_PLACEHOLDER}`,
+      'https://localhost:443/other',
+    ]);
+    assert.equal(received.length, 1);
+    assert.equal(received[0].headers.authorization, `Bearer ${OTHER_PLACEHOLDER}`);
   });
 
   it('substitutes in the body only for a secret that allows it', async () => {

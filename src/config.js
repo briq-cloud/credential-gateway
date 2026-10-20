@@ -61,12 +61,17 @@ export class Config {
     this.secrets = [];
     /** @type {Map<string, string>} IPv6 address → briq id */
     this.briqByIp = new Map();
+    /** @type {Map<string, Set<string>>} briq id → the names of the team secrets its env names */
+    this.secretsByBriq = new Map();
+    this.lastRefreshAt = 0;
     this.timer = null;
   }
 
   async refresh() {
     const c = await this.api.config();
     this.secrets = c.secrets ?? [];
+    this.secretsByBriq = new Map((c.briqs ?? []).map((b) => [b.id, new Set(b.secrets ?? [])]));
+    this.lastRefreshAt = Date.now();
     if (this.resolve6) {
       const byIp = new Map();
       await Promise.all(
@@ -105,14 +110,37 @@ export class Config {
     if (this.timer) clearInterval(this.timer);
   }
 
-  /** The secrets that apply to a request to `host`. */
-  forHost(host) {
-    return this.secrets.filter((s) => (s.hosts ?? []).some((p) => hostMatches(p, host)));
+  /**
+   * The secrets that apply to a request from `briqId` to `host`: the ones that briq named in its
+   * env, for that host. Naming a secret at run is the grant; a request from no known briq gets
+   * none, and another briq's placeholder passes through as text.
+   */
+  forHost(host, briqId) {
+    const named = briqId ? this.secretsByBriq.get(briqId) : undefined;
+    if (!named) return [];
+    return this.secrets.filter(
+      (s) => named.has(s.name) && (s.hosts ?? []).some((p) => hostMatches(p, host)),
+    );
   }
 
   /** Which briq an address belongs to, when the API told us about it. */
   briqOf(address) {
     return this.briqByIp.get(normalizeIp(address)) ?? null;
+  }
+
+  /**
+   * `briqOf`, asking the API again first when the address is new to us (at most every two
+   * seconds): a briq that just booted is making its first requests before the next refresh.
+   */
+  async resolveBriq(address) {
+    const known = this.briqOf(address);
+    if (known || Date.now() - this.lastRefreshAt < 2_000) return known;
+    try {
+      await this.refresh();
+    } catch (err) {
+      this.log({ level: 'warn', message: 'config refresh failed', err: String(err) });
+    }
+    return this.briqOf(address);
   }
 }
 

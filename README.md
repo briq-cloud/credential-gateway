@@ -15,9 +15,11 @@ this repo is here so you can read what sits between your sandbox and the interne
 
 ## What it does
 
-- **CONNECT to a host one of the team's secrets allows** (port 443): the gateway answers the TLS
-  handshake with a certificate from its own CA, reads each request, replaces every placeholder
-  with the real value where the secret allows it (request headers; the body too when the secret
+- **CONNECT to a host one of the calling briq's secrets allows** (port 443): the API tells the
+  gateway which briq, by address, named which team secrets in its env; only those are put in,
+  and only for that briq. The gateway answers the TLS handshake with a certificate from its own
+  CA, reads each request, replaces each of those placeholders with the real value where the
+  secret allows it (request headers; the body too when the secret
   says so), and sends the request on over its own TLS connection to the real host, asking for an
   uncompressed answer. In the response, the real value, if the host echoes it, becomes the
   placeholder again, in headers and body; a compressed answer is decompressed first, or refused.

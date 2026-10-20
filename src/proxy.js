@@ -3,6 +3,8 @@
 // requests, swaps each placeholder for the real value where the secret allows (headers, body),
 // sends them on over its own TLS connection, and rewrites the real value back to the placeholder
 // in what comes back. Any other host is tunnelled byte for byte: the gateway sees nothing of it.
+// Only the secrets the calling briq named in its env are put in: the API says which briq, by
+// address, named which.
 // Plain HTTP through the proxy is forwarded as it is, never injected: a real value in clear is
 // not something we send.
 import http from 'node:http';
@@ -94,14 +96,16 @@ export function createProxy({ config, leafs, events, log }, opts = {}) {
       socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
       return;
     }
-    const briqId = config.briqOf(socket.remoteAddress ?? '');
-    const secrets = port === 443 ? config.forHost(host) : [];
     socket.on('error', () => socket.destroy());
-    if (!secrets.length) {
-      tunnel(host, port, socket, head, log);
-      return;
-    }
-    mitm(host, port, socket, head, secrets, briqId).catch((err) => {
+    (async () => {
+      const briqId = await config.resolveBriq(socket.remoteAddress ?? '');
+      const secrets = port === 443 ? config.forHost(host, briqId) : [];
+      if (!secrets.length) {
+        tunnel(host, port, socket, head, log);
+        return;
+      }
+      await mitm(host, port, socket, head, secrets, briqId);
+    })().catch((err) => {
       log({ level: 'warn', message: 'intercept failed', host, err: String(err) });
       socket.destroy();
     });
