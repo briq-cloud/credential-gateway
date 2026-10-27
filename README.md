@@ -27,8 +27,12 @@ this repo is here so you can read what sits between your sandbox and the interne
 - **CONNECT to any other host**: a tunnel, byte for byte. The gateway sees nothing of it.
 - **Plain HTTP through the proxy**: forwarded as it is, never injected. A real value in clear is
   not something it sends.
+- **A briq that just started**: the gateway knows a briq by its address on the private network.
+  A request from an address it does not know yet waits up to 10 seconds while it asks the API
+  again; still unknown after that, it is tunnelled without secrets.
 - **Reports** to the briq API which briq used which secret against which host and method,
-  batched per minute: that is the team's audit log.
+  batched and sent every 30 seconds: that is the team's audit log. A batch the API does not take
+  is sent again with the next.
 
 The CA is made on the gateway's first boot and kept on its volume; its private key never leaves
 the machine. The API only ever gets the certificate.

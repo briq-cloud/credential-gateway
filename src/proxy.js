@@ -99,6 +99,15 @@ export function createProxy({ config, leafs, events, log }, opts = {}) {
     socket.on('error', () => socket.destroy());
     (async () => {
       const briqId = await config.resolveBriq(socket.remoteAddress ?? '');
+      // Every briq that goes through the gateway is in its config; an address none has is
+      // tunnelled without secrets, and says so.
+      if (!briqId)
+        log({
+          level: 'warn',
+          message: 'request from an unknown address, tunnelled without secrets',
+          address: socket.remoteAddress,
+          host,
+        });
       const secrets = port === 443 ? config.forHost(host, briqId) : [];
       if (!secrets.length) {
         tunnel(host, port, socket, head, log);

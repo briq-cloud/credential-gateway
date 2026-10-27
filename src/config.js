@@ -52,10 +52,11 @@ export class Api {
 
 /** The live config, refreshed on a timer; the last good one stays when a fetch fails. */
 export class Config {
-  /** @param {Api} api @param {{ refreshMs?: number, resolve6?: (host: string) => Promise<string[]>, log?: (line: object) => void }} opts */
-  constructor(api, { refreshMs = 15_000, resolve6, log = () => {} } = {}) {
+  /** @param {Api} api @param {{ refreshMs?: number, unknownWaitMs?: number, resolve6?: (host: string) => Promise<string[]>, log?: (line: object) => void }} opts */
+  constructor(api, { refreshMs = 15_000, unknownWaitMs = 10_000, resolve6, log = () => {} } = {}) {
     this.api = api;
     this.refreshMs = refreshMs;
+    this.unknownWaitMs = unknownWaitMs;
     this.resolve6 = resolve6;
     this.log = log;
     this.secrets = [];
@@ -66,6 +67,10 @@ export class Config {
     /** @type {Map<string, any[]>} briq id → its own secrets with hosts (same shape as a team's) */
     this.ownByBriq = new Map();
     this.lastRefreshAt = 0;
+    /** When `refreshSoon` last asked, whatever the answer. */
+    this.lastAskedAt = 0;
+    /** @type {Promise<void> | null} */
+    this.asking = null;
     this.timer = null;
   }
 
@@ -134,18 +139,35 @@ export class Config {
   }
 
   /**
-   * `briqOf`, asking the API again first when the address is new to us (at most every two
-   * seconds): a briq that just booted is making its first requests before the next refresh.
+   * `briqOf`, asking the API again while the address is new to us, for up to `unknownWaitMs`: a
+   * briq that just booted makes its first requests before the next refresh, and its name can take
+   * a few seconds more to resolve on the private network. A request from an address still unknown
+   * after that is tunnelled without secrets.
    */
   async resolveBriq(address) {
-    const known = this.briqOf(address);
-    if (known || Date.now() - this.lastRefreshAt < 2_000) return known;
-    try {
-      await this.refresh();
-    } catch (err) {
-      this.log({ level: 'warn', message: 'config refresh failed', err: String(err) });
+    const deadline = Date.now() + this.unknownWaitMs;
+    for (;;) {
+      const known = this.briqOf(address);
+      if (known || Date.now() >= deadline) return known;
+      await this.refreshSoon();
     }
-    return this.briqOf(address);
+  }
+
+  /** A refresh shared by every connection waiting on one, at most one a second. */
+  refreshSoon() {
+    this.asking ??= (async () => {
+      const wait = this.lastAskedAt + 1_000 - Date.now();
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      this.lastAskedAt = Date.now();
+      try {
+        await this.refresh();
+      } catch (err) {
+        this.log({ level: 'warn', message: 'config refresh failed', err: String(err) });
+      }
+    })().finally(() => {
+      this.asking = null;
+    });
+    return this.asking;
   }
 }
 
@@ -157,12 +179,16 @@ export function normalizeIp(ip) {
     .toLowerCase();
 }
 
-/** Usage, batched per (briq, host, secrets, status class) and flushed on a timer. */
+/**
+ * Usage, batched per (briq, host, secrets, status class) and flushed on a timer. A batch the API
+ * did not take is kept for the next flush, up to `maxPending` entries.
+ */
 export class Events {
-  /** @param {Api} api @param {{ flushMs?: number, log?: (line: object) => void }} opts */
-  constructor(api, { flushMs = 30_000, log = () => {} } = {}) {
+  /** @param {Api} api @param {{ flushMs?: number, maxPending?: number, log?: (line: object) => void }} opts */
+  constructor(api, { flushMs = 30_000, maxPending = 1_000, log = () => {} } = {}) {
     this.api = api;
     this.log = log;
+    this.maxPending = maxPending;
     /** @type {Map<string, { briqId: string | null, host: string, method: string, status: number, secrets: string[], count: number, firstAt: string, lastAt: string }>} */
     this.pending = new Map();
     this.timer = setInterval(() => this.flush(), flushMs);
@@ -171,14 +197,14 @@ export class Events {
 
   record({ briqId, host, method, status, secrets }) {
     const names = [...secrets].sort();
-    const key = `${briqId}|${host}|${method}|${Math.floor(status / 100)}|${names.join(',')}`;
+    const key = Events.key({ briqId, host, method, status, secrets: names });
     const now = new Date().toISOString();
     const e = this.pending.get(key);
     if (e) {
       e.count += 1;
       e.lastAt = now;
       e.status = status;
-    } else
+    } else if (this.pending.size < this.maxPending)
       this.pending.set(key, {
         briqId,
         host,
@@ -191,6 +217,10 @@ export class Events {
       });
   }
 
+  static key({ briqId, host, method, status, secrets }) {
+    return `${briqId}|${host}|${method}|${Math.floor(status / 100)}|${secrets.join(',')}`;
+  }
+
   async flush() {
     if (!this.pending.size) return;
     const events = [...this.pending.values()];
@@ -200,10 +230,18 @@ export class Events {
     } catch (err) {
       this.log({
         level: 'warn',
-        message: 'events not delivered',
+        message: 'events not delivered, kept for the next flush',
         err: String(err),
         count: events.length,
       });
+      for (const e of events) {
+        const key = Events.key(e);
+        const later = this.pending.get(key);
+        if (later) {
+          later.count += e.count;
+          later.firstAt = e.firstAt;
+        } else if (this.pending.size < this.maxPending) this.pending.set(key, e);
+      }
     }
   }
 

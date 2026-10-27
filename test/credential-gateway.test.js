@@ -35,6 +35,71 @@ describe('hostMatches', () => {
   });
 });
 
+describe('a briq the gateway does not know yet', () => {
+  /** A fake API that lists one briq, whose name resolves only after `failures` lookups. */
+  const world = (failures) => {
+    let lookups = 0;
+    let configs = 0;
+    const api = {
+      config: async () => {
+        configs++;
+        return { secrets: [], briqs: [{ id: 'bq_new', host: 'new.internal', secrets: [] }] };
+      },
+    };
+    const resolve6 = async () => {
+      if (++lookups <= failures) throw new Error('ENOTFOUND');
+      return ['fdaa::7'];
+    };
+    return { api, resolve6, configs: () => configs };
+  };
+
+  it('waits for its name to resolve, one refresh a second for every connection waiting', async () => {
+    const w = world(2);
+    const config = new Config(w.api, { resolve6: w.resolve6, unknownWaitMs: 5_000 });
+    const t0 = Date.now();
+    const ids = await Promise.all([config.resolveBriq('fdaa::7'), config.resolveBriq('fdaa::7')]);
+    assert.deepEqual(ids, ['bq_new', 'bq_new']);
+    assert.equal(w.configs(), 3);
+    assert.ok(Date.now() - t0 >= 1_900, 'refreshes spaced by a second');
+  });
+
+  it('gives up after its wait: no briq, so no secrets', async () => {
+    const w = world(Number.POSITIVE_INFINITY);
+    const config = new Config(w.api, { resolve6: w.resolve6, unknownWaitMs: 1_500 });
+    assert.equal(await config.resolveBriq('fdaa::7'), null);
+    assert.ok(w.configs() <= 3);
+  });
+});
+
+describe('usage events', () => {
+  it('keeps a batch the API did not take for the next flush, merged with what came after', async () => {
+    const posted = [];
+    let down = true;
+    const api = {
+      events: async (events) => {
+        if (down) throw new Error('POST /internal/credential-gateway/events: 502');
+        posted.push(...events);
+      },
+    };
+    const events = new Events(api, { flushMs: 60_000 });
+    const e = {
+      briqId: 'bq_a',
+      host: 'api.example.com',
+      method: 'GET',
+      status: 200,
+      secrets: ['K'],
+    };
+    events.record(e);
+    await events.flush();
+    assert.equal(posted.length, 0);
+    events.record(e);
+    down = false;
+    await events.stop();
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].count, 2);
+  });
+});
+
 describe('the gateway', () => {
   const dir = mkdtempSync(join(tmpdir(), 'briq-gw-'));
   /** @type {any} */ let destination;
