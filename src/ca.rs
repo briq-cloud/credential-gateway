@@ -22,6 +22,9 @@ use time::{Duration, OffsetDateTime};
 
 const CERT_FILE: &str = "ca.crt";
 const KEY_FILE: &str = "ca.key";
+/// Leaf certificates kept; past it, the expired ones go, then all of them (a wildcard host
+/// pattern lets a client ask for any number of names).
+const MAX_LEAFS: usize = 1024;
 
 pub struct Ca {
     /// The certificate, PEM: what the API is told and the briqs trust.
@@ -155,10 +158,14 @@ impl Leafs {
         // HTTP/1.1 only: clients that offer h2 fall back.
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         let cfg = Arc::new(cfg);
-        self.cache
-            .lock()
-            .unwrap()
-            .insert(host.to_string(), (cfg.clone(), not_after));
+        let mut cache = self.cache.lock().unwrap();
+        if cache.len() >= MAX_LEAFS {
+            cache.retain(|_, (_, expires)| *expires > now + Duration::days(1));
+            if cache.len() >= MAX_LEAFS {
+                cache.clear();
+            }
+        }
+        cache.insert(host.to_string(), (cfg.clone(), not_after));
         Ok(cfg)
     }
 }

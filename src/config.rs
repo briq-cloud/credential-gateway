@@ -8,6 +8,7 @@ use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -182,6 +183,8 @@ pub fn dns() -> Resolve {
 
 #[derive(Default)]
 struct State {
+    /// Which read this is: a slower, older read never replaces a newer one.
+    generation: u64,
     secrets: Vec<Secret>,
     by_ip: HashMap<IpAddr, String>,
     named: HashMap<String, HashSet<String>>,
@@ -194,6 +197,7 @@ pub struct Config {
     resolve: Resolve,
     unknown_wait: Duration,
     state: RwLock<Arc<State>>,
+    reads: AtomicU64,
     /// When the last shared refresh was asked for (`refresh_soon`).
     asked: Mutex<Option<Instant>>,
 }
@@ -205,14 +209,25 @@ impl Config {
             resolve,
             unknown_wait,
             state: RwLock::new(Arc::new(State::default())),
+            reads: AtomicU64::new(0),
             asked: Mutex::new(None),
         }
     }
 
     pub async fn refresh(&self) -> Result<(), BoxError> {
+        let generation = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
         let doc = self.api.config().await?;
-        let mut by_ip = HashMap::new();
-        let lookups = doc.briqs.iter().map(|b| (self.resolve)(b.host.clone()));
+        let lookups = doc.briqs.iter().map(|b| {
+            let lookup = (self.resolve)(b.host.clone());
+            async move {
+                timeout(Duration::from_secs(5), lookup)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            }
+        });
+        let mut by_ip: HashMap<IpAddr, String> = HashMap::new();
+        let mut shared = HashSet::new();
         for (b, addrs) in doc
             .briqs
             .iter()
@@ -220,10 +235,25 @@ impl Config {
         {
             // A briq that is not running has no address; it is not sending requests either.
             for ip in addrs.unwrap_or_default() {
-                by_ip.insert(normalize_ip(ip), b.id.clone());
+                let ip = normalize_ip(ip);
+                match by_ip.get(&ip) {
+                    Some(other) if other != &b.id => {
+                        shared.insert(ip);
+                    }
+                    _ => {
+                        by_ip.insert(ip, b.id.clone());
+                    }
+                }
             }
         }
+        // An address two briqs claim (one gone, its address given again, a name not yet
+        // updated) is nobody's: its requests get no secrets until it is one briq's again.
+        for ip in &shared {
+            by_ip.remove(ip);
+            crate::log!(Warn, "an address two briqs claim gets no secrets", "address": ip.to_string());
+        }
         let state = State {
+            generation,
             secrets: doc.secrets,
             named: doc
                 .briqs
@@ -234,7 +264,10 @@ impl Config {
             by_ip,
         };
         crate::log!(Debug, "config refreshed", "secrets": state.secrets.len(), "briqs": state.by_ip.len());
-        *self.state.write().unwrap() = Arc::new(state);
+        let mut current = self.state.write().unwrap();
+        if generation > current.generation {
+            *current = Arc::new(state);
+        }
         Ok(())
     }
 
@@ -294,7 +327,8 @@ impl Config {
             if known.is_some() || Instant::now() >= deadline {
                 return known;
             }
-            self.refresh_soon().await;
+            // A slow API or resolver does not hold the connection past its wait.
+            let _ = tokio::time::timeout_at(deadline, self.refresh_soon()).await;
         }
     }
 

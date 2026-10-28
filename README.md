@@ -2,8 +2,9 @@
 
 The credential gateway of [briq](https://briq.cloud): the proxy a team's briqs reach the internet
 through. A briq holds a placeholder instead of a secret; on the way out, to the hosts the secret
-allows, the gateway puts the real value in. The real value never enters the briq, not in its
-environment, not in a response.
+allows, the gateway puts the real value in. The real value is never in the briq's environment,
+and a response that echoes it as it is gets the placeholder back instead (see Limits for what
+that does not cover).
 
 ```
 ghcr.io/briq-cloud/credential-gateway:<commit sha>
@@ -19,7 +20,8 @@ One static binary (Rust: tokio, hyper, rustls), a few MB of memory.
 
 - **CONNECT to a host one of the calling briq's secrets allows** (port 443): the API tells the
   gateway which briq, by address, named which team secrets in its env, and which secrets of its
-  own (given at run with `hosts`) it holds; only those are put in, and only for that briq. The
+  own (given at run with `hosts`) it holds; only those are put in, and only for that briq, read
+  again for each request (a revoked or rotated secret stops at the next one). The
   gateway answers the TLS handshake with a certificate from its own CA, reads each request,
   replaces each of those placeholders with the real value where the secret allows it (request
   headers; the body too when the secret says so), and sends the request on over its own TLS
@@ -30,17 +32,19 @@ One static binary (Rust: tokio, hyper, rustls), a few MB of memory.
 - **Both directions stream.** A response goes on as the host writes it (server-sent events
   included); the gateway only keeps back a tail that could be the start of a real value, until
   the next bytes say. A request body with a secret allowed in it is held up to 8 MB to keep its
-  `Content-Length`; a larger one is rewritten as it streams and sent chunked.
+  `Content-Length` (eight such bodies at a time); a larger one, or one past those eight, is
+  rewritten as it streams and sent chunked.
 - **CONNECT to any other host**: a tunnel, byte for byte. The gateway sees nothing of it.
 - **Plain HTTP through the proxy**: forwarded as it is, never injected. A real value in clear is
   not something it sends.
 - **A briq that just started**: the gateway knows a briq by its address on the private network.
   A request from an address it does not know yet waits up to 10 seconds while it asks the API
   again (at most once a second, shared by every waiting connection); still unknown after that, it
-  is tunnelled without secrets.
+  is tunnelled without secrets. An address two briqs claim gets no secrets either.
 - **Reports** to the briq API which briq used which secret against which host and method,
   batched and sent every 30 seconds and on shutdown: that is the team's audit log. A batch the
-  API does not take is sent again with the next.
+  API does not take is sent again with the next. A report of a secret put in is never dropped
+  for room.
 
 The CA is made on the gateway's first boot and kept on its volume; its private key never leaves
 the machine. The API only ever gets the certificate. A CA that is on the volume but cannot be read
@@ -56,7 +60,12 @@ stops the gateway rather than being replaced: the team's briqs trust the one the
 - A token exchange (OAuth client credentials) returns the new token into the briq unredacted:
   exchange outside, store the result.
 - A response from an intercepted host loses its `Content-Length` (what is replaced changes the
-  length): it is sent chunked.
+  length): it is sent chunked. Its trailers are dropped.
+- Scrubbing replaces the real value as bytes. An echo that changes it (escaped, encoded, cut,
+  compressed without saying so) is not caught, and neither is a value the briq stores on an
+  allowed host (an issue body, a gist) and reads back changed. The gateway keeps a value out of
+  the briq's environment and out of plain echoes; a host that the briq can make return what it
+  sent is a host that can return the value.
 - A briq can bypass the proxy; it then carries only placeholders, which are worthless without it.
 
 ## Configuration

@@ -29,11 +29,12 @@ use hyper::service::service_fn;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::io::{ReaderStream, StreamReader};
 
@@ -78,8 +79,17 @@ impl Default for Options {
     }
 }
 
+/// How many request bodies may be held at once (each up to `max_body`); past that, a body is
+/// rewritten as it streams instead.
+const HELD_BODIES: usize = 8;
+
+/// How long a client has to send a request's headers, the next one on a kept-alive connection
+/// included.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct Gateway {
     config: Arc<Config>,
+    held: Arc<Semaphore>,
     leafs: Arc<Leafs>,
     events: Arc<Events>,
     opts: Options,
@@ -119,6 +129,7 @@ impl Gateway {
         plain.set_connect_timeout(Some(Duration::from_secs(10)));
         Arc::new(Self {
             config,
+            held: Arc::new(Semaphore::new(HELD_BODIES)),
             leafs,
             events,
             opts,
@@ -146,6 +157,8 @@ impl Gateway {
                     async move { Ok::<_, Infallible>(gw.outer(req, peer).await) }
                 });
                 let _ = http1::Builder::new()
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(HEADER_TIMEOUT)
                     .serve_connection(TokioIo::new(stream), svc)
                     .with_upgrades()
                     .await;
@@ -193,12 +206,9 @@ impl Gateway {
             crate::log!(Warn, "request from an unknown address, tunnelled without secrets",
                 "address": peer.ip().to_string(), "host": host);
         }
-        let secrets = if port == 443 {
-            self.config.for_host(&host, briq.as_deref())
-        } else {
-            Vec::new()
-        };
-        if secrets.is_empty() {
+        // Whether to intercept is decided here; which secrets apply is read again for each
+        // request, so a revoked or rotated secret stops at the next one, kept-alive or not.
+        if port != 443 || self.config.for_host(&host, briq.as_deref()).is_empty() {
             return tunnel(req, &host, port).await;
         }
         let tls = match self.leafs.for_host(&host) {
@@ -209,7 +219,6 @@ impl Gateway {
             }
         };
         let on_upgrade = hyper::upgrade::on(req);
-        let secrets = Arc::new(secrets);
         tokio::spawn(async move {
             let Ok(upgraded) = on_upgrade.await else {
                 return;
@@ -222,13 +231,9 @@ impl Gateway {
                 }
             };
             let svc = service_fn(move |req| {
-                let (gw, host, secrets, briq) =
-                    (self.clone(), host.clone(), secrets.clone(), briq.clone());
+                let (gw, host, briq) = (self.clone(), host.clone(), briq.clone());
                 async move {
-                    let res = match gw
-                        .intercept(req, &host, port, &secrets, briq.as_deref())
-                        .await
-                    {
+                    let res = match gw.intercept(req, &host, port, briq.as_deref()).await {
                         Ok(res) => res,
                         Err(err) => {
                             crate::log!(Warn, "request failed", "host": host, "err": err.to_string());
@@ -239,6 +244,8 @@ impl Gateway {
                 }
             });
             let _ = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_TIMEOUT)
                 .serve_connection(TokioIo::new(stream), svc)
                 .await;
         });
@@ -251,9 +258,9 @@ impl Gateway {
         req: Request<Incoming>,
         host: &str,
         port: u16,
-        secrets: &[Secret],
         briq: Option<&str>,
     ) -> Result<Response<Body>, BoxError> {
+        let secrets = self.config.for_host(host, briq);
         // The request must address the CONNECT host: a Host naming another site on the same
         // address (a shared CDN) would carry the real value there. An absolute-form target is
         // refused too.
@@ -271,7 +278,7 @@ impl Gateway {
         }
         let (parts, body) = req.into_parts();
         let mut headers = forward_headers(&parts.headers);
-        headers.insert(header::HOST, HeaderValue::from_str(host)?);
+        headers.insert(header::HOST, HeaderValue::from_str(&bracketed(host))?);
         // Scrubbing reads the response: ask for it uncompressed.
         headers.insert(
             header::ACCEPT_ENCODING,
@@ -296,11 +303,19 @@ impl Gateway {
         // rewritten as it streams past that. Without such a secret it goes on untouched.
         let in_body: Vec<&Secret> = secrets.iter().filter(|s| s.allows("body")).collect();
         let mut body_hits = None;
+        let mut _held = None;
         let body: Body = match replacer(&in_body, |s| (&s.placeholder, &s.value)) {
             None => boxed(body),
             Some(r) => {
                 let r = Arc::new(r);
-                let (head, rest) = read_up_to(body, self.opts.max_body).await?;
+                let (head, rest) = match self.held.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        _held = Some(permit);
+                        read_up_to(body, self.opts.max_body).await?
+                    }
+                    // As many bodies held as allowed: this one streams from its first byte.
+                    Err(_) => (BytesMut::new(), Some(body)),
+                };
                 match rest {
                     None => {
                         let (out, hits) = r.replace_all(&head);
@@ -338,10 +353,14 @@ impl Gateway {
             .unwrap_or("/");
         let mut up = Request::builder()
             .method(parts.method.clone())
-            .uri(Uri::try_from(format!("https://{host}:{port}{path}"))?)
+            .uri(Uri::try_from(format!(
+                "https://{}:{port}{path}",
+                bracketed(host)
+            ))?)
             .body(body)?;
         *up.headers_mut() = headers;
-        let res = self.upstream.request(up).await?;
+        let res = self.upstream.request(up).await;
+        drop(_held);
         if let Some(h) = &body_hits {
             used.extend(
                 in_body
@@ -351,22 +370,26 @@ impl Gateway {
                     .map(|(_, s)| s.name.clone()),
             );
         }
-        self.events.record(
-            briq,
-            host,
-            parts.method.as_str(),
-            res.status().as_u16(),
-            used,
-        );
+        // A request that failed after it left still carried the values: it is recorded too.
+        let code = res.as_ref().map_or(502, |r| r.status().as_u16());
+        self.events
+            .record(briq, host, parts.method.as_str(), code, used);
+        let res = res?;
 
         // What comes back: a real value, if the destination echoes it, becomes the placeholder
         // again, in headers and body. Every secret that applies to this request, used or not.
-        let scrub = Arc::new(
-            replacer(&secrets.iter().collect::<Vec<_>>(), |s| {
-                (&s.value, &s.placeholder)
-            })
-            .ok_or("no secret to scrub")?,
-        );
+        let Some(scrub) = replacer(&secrets.iter().collect::<Vec<_>>(), |s| {
+            (&s.value, &s.placeholder)
+        }) else {
+            // No secret applies any more (revoked since the connection opened): nothing to
+            // scrub, the response goes on as it came.
+            let (p, b) = res.into_parts();
+            let mut out = Response::new(boxed(b));
+            *out.status_mut() = p.status;
+            *out.headers_mut() = forward_headers(&p.headers);
+            return Ok(out);
+        };
+        let scrub = Arc::new(scrub);
         let (parts_res, body) = res.into_parts();
         let mut out = Response::builder()
             .status(parts_res.status)
@@ -389,11 +412,24 @@ impl Gateway {
         }
         // The length changes with what is replaced: the body goes out chunked.
         headers.remove(header::CONTENT_LENGTH);
-        let encoding = headers
-            .get(header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.trim().to_ascii_lowercase())
-            .filter(|v| !v.is_empty() && v != "identity");
+        // Every coding of every Content-Encoding header, in order: one at most can be read.
+        let mut codings = Vec::new();
+        for v in headers.get_all(header::CONTENT_ENCODING) {
+            let v = v.to_str().map_err(|_| "an unreadable Content-Encoding")?;
+            codings.extend(
+                v.split(',')
+                    .map(|c| c.trim().to_ascii_lowercase())
+                    .filter(|c| !c.is_empty() && c != "identity"),
+            );
+        }
+        let encoding = match codings.len() {
+            0 => None,
+            1 => codings.pop(),
+            _ => Some(codings.join(", ")),
+        };
+        if encoding.is_none() {
+            headers.remove(header::CONTENT_ENCODING);
+        }
         let body: Body = match encoding {
             None => boxed(body),
             // Asked for none, got a compressed body: read it to scrub it, or refuse it. A real
@@ -555,6 +591,15 @@ fn names(secrets: &[&Secret], hits: &[bool]) -> Vec<String> {
         .filter(|(_, h)| **h)
         .map(|(s, _)| s.name.clone())
         .collect()
+}
+
+/// A host as it goes in a URI or a Host header: an IPv6 address in brackets.
+fn bracketed(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
 }
 
 fn strip_port(host: &str) -> &str {

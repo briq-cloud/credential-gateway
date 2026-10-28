@@ -169,7 +169,21 @@ async fn destination(dir: &Path) -> Destination {
                     })
                     .to_string();
                     // A server that compresses whatever the client asked for.
-                    if parts.headers.contains_key("x-test-gzip") {
+                    if let Some(enc) = parts.headers.get("x-test-encoding") {
+                        res = res.header("content-encoding", enc.clone());
+                        res.body(full(payload)).unwrap()
+                    } else if parts.uri.path() == "/dup-encoding" {
+                        // Two Content-Encoding headers, the first one saying there is none.
+                        let mut gz = flate2::write::GzEncoder::new(
+                            Vec::new(),
+                            flate2::Compression::default(),
+                        );
+                        gz.write_all(payload.as_bytes()).unwrap();
+                        res = res
+                            .header("content-encoding", "identity")
+                            .header("content-encoding", "gzip");
+                        res.body(full(gz.finish().unwrap())).unwrap()
+                    } else if parts.headers.contains_key("x-test-gzip") {
                         let mut gz = flate2::write::GzEncoder::new(
                             Vec::new(),
                             flate2::Compression::default(),
@@ -201,13 +215,15 @@ struct ApiState {
     events: Mutex<Vec<Value>>,
     configs: AtomicUsize,
     events_down: AtomicBool,
+    config: Mutex<Value>,
 }
 
 async fn fake_api(config: Value) -> (String, Arc<ApiState>) {
     let state = Arc::new(ApiState::default());
+    *state.config.lock().unwrap() = config;
     let st = state.clone();
     let port = serve(None, move |req: Request<Incoming>| {
-        let (st, config) = (st.clone(), config.clone());
+        let st = st.clone();
         async move {
             let ok = req.headers().get("authorization").map(|v| v.as_bytes())
                 == Some(b"Bearer gw-token");
@@ -225,7 +241,7 @@ async fn fake_api(config: Value) -> (String, Arc<ApiState>) {
                 }
                 ("GET", "/internal/credential-gateway/config") => {
                     st.configs.fetch_add(1, Ordering::SeqCst);
-                    Response::new(full(config.to_string()))
+                    Response::new(full(st.config.lock().unwrap().to_string()))
                 }
                 ("POST", "/internal/credential-gateway/events") => {
                     if st.events_down.load(Ordering::SeqCst) {
@@ -273,6 +289,7 @@ struct World {
     dest: Destination,
     api: Arc<ApiState>,
     events: Arc<Events>,
+    config: Arc<Config>,
     proxy: u16,
     ca_pem: PathBuf,
 }
@@ -300,7 +317,7 @@ async fn world_with(state: Option<&Path>) -> World {
     config.refresh().await.unwrap();
     let events = Events::new(api);
     let gw = Gateway::new(
-        config,
+        config.clone(),
         Arc::new(Leafs::new(ca).unwrap()),
         events.clone(),
         Options {
@@ -317,6 +334,7 @@ async fn world_with(state: Option<&Path>) -> World {
         dest,
         api: api_state,
         events,
+        config,
         proxy,
         ca_pem,
     }
@@ -835,4 +853,199 @@ async fn gives_up_on_an_unknown_address_after_its_wait() {
     let ip: IpAddr = "fdaa::7".parse().unwrap();
     assert_eq!(config.resolve_briq(ip).await, None);
     assert!(api.configs.load(Ordering::SeqCst) <= 3);
+}
+
+#[tokio::test]
+async fn reads_a_response_whose_codings_come_in_two_headers() {
+    let w = world().await;
+    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    // `identity` then `gzip`: read as gzip, scrubbed.
+    let out = w
+        .curl(&[
+            "--cacert",
+            w.cacert(),
+            "--compressed",
+            "-H",
+            &auth,
+            "https://localhost:443/dup-encoding",
+        ])
+        .await;
+    assert!(
+        out.contains(&format!("\"auth\":\"Bearer {PLACEHOLDER}\"")),
+        "{out}"
+    );
+    assert!(!out.contains(SECRET), "the real value reached the client");
+}
+
+#[tokio::test]
+async fn refuses_a_response_it_cannot_read() {
+    let w = world().await;
+    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let out = w
+        .curl(&[
+            "--cacert",
+            w.cacert(),
+            "-H",
+            &auth,
+            "-H",
+            "x-test-encoding: gzip, br",
+            "-w",
+            "\n%{http_code}",
+            "https://localhost:443/x",
+        ])
+        .await;
+    assert!(out.ends_with("502"), "{out}");
+    assert!(!out.contains(SECRET), "the real value reached the client");
+}
+
+/// A request on a connection kept open from before a secret was revoked: the secret is not put
+/// in any more.
+#[tokio::test]
+async fn reads_which_secrets_apply_for_each_request_on_a_kept_alive_connection() {
+    use hyper::client::conn::http1 as client;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let w = world().await;
+    let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", w.proxy))
+        .await
+        .unwrap();
+    tcp.write_all(b"CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    while !answer.ends_with(b"\r\n\r\n") {
+        answer.push(tcp.read_u8().await.unwrap());
+    }
+    assert!(
+        answer.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&answer)
+    );
+    let mut roots = rustls::RootCertStore::empty();
+    let pem = std::fs::read_to_string(&w.ca_pem).unwrap();
+    let der = pem::parse(pem).unwrap().into_contents();
+    roots
+        .add(rustls_pki_types::CertificateDer::from(der))
+        .unwrap();
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(tls))
+        .connect(name, tcp)
+        .await
+        .unwrap();
+    let (mut send, conn) = client::handshake::<_, Body>(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let req = || {
+        Request::builder()
+            .uri("/kept")
+            .header("host", "localhost")
+            .header("authorization", format!("Bearer {PLACEHOLDER}"))
+            .body(full(""))
+            .unwrap()
+    };
+    send.send_request(req())
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    // TOKEN revoked: the briq no longer names it.
+    w.api.config.lock().unwrap()["briqs"][0]["secrets"] = json!(["BODY"]);
+    w.config.refresh().await.unwrap();
+    send.send_request(req())
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    let got = w.received();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].headers["authorization"], format!("Bearer {SECRET}"));
+    assert_eq!(
+        got[1].headers["authorization"],
+        format!("Bearer {PLACEHOLDER}")
+    );
+}
+
+#[tokio::test]
+async fn gives_no_secrets_to_an_address_two_briqs_claim() {
+    credential_gateway::log::set_level("off");
+    let config = json!({ "secrets": [], "briqs": [
+        { "id": "bq_old", "host": "old.internal", "secrets": ["TOKEN"] },
+        { "id": "bq_new", "host": "new.internal", "secrets": [] },
+        { "id": "bq_other", "host": "other.internal", "secrets": [] },
+    ]});
+    let (url, _) = fake_api(config).await;
+    let resolve: Resolve = Arc::new(|host| {
+        Box::pin(async move {
+            Ok(vec![
+                if host == "other.internal" {
+                    "10.0.0.9"
+                } else {
+                    "10.0.0.5"
+                }
+                .parse()
+                .unwrap(),
+            ])
+        })
+    });
+    let config = Config::new(
+        Arc::new(Api::new(&url, "gw-token")),
+        resolve,
+        Duration::from_millis(10),
+    );
+    config.refresh().await.unwrap();
+    assert_eq!(config.briq_of("10.0.0.5".parse().unwrap()), None);
+    assert_eq!(
+        config.briq_of("10.0.0.9".parse().unwrap()).as_deref(),
+        Some("bq_other")
+    );
+}
+
+#[tokio::test]
+async fn never_drops_an_event_that_put_a_secret_in() {
+    let w = world().await;
+    for i in 0..1_500 {
+        w.events.record(
+            Some("bq_test"),
+            "localhost",
+            &format!("JUNK{i}"),
+            200,
+            vec![],
+        );
+    }
+    for i in 0..1_200 {
+        w.events.record(
+            Some("bq_test"),
+            &format!("h{i}.example.com"),
+            "GET",
+            200,
+            vec![],
+        );
+    }
+    w.events.record(
+        Some("bq_test"),
+        "localhost",
+        "get",
+        200,
+        vec!["TOKEN".into()],
+    );
+    w.events.flush().await;
+    let posted = w.api.events.lock().unwrap().clone();
+    let token: Vec<_> = posted
+        .iter()
+        .filter(|e| e["secrets"] == json!(["TOKEN"]))
+        .collect();
+    assert_eq!(token.len(), 1);
+    assert_eq!(token[0]["method"], "GET");
+    assert!(
+        posted.iter().any(|e| e["method"] == "OTHER"),
+        "a made-up method is OTHER"
+    );
+    assert!(posted.len() <= 1_002, "{}", posted.len());
 }

@@ -11,7 +11,6 @@ use std::task::{Context, Poll, ready};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use bytes::Bytes;
-use http::HeaderMap;
 use http_body::{Body, Frame};
 use pin_project_lite::pin_project;
 
@@ -127,8 +126,13 @@ impl Stream {
         let cut = buf.len().saturating_sub(self.r.longest - 1);
         let mut out = Vec::with_capacity(buf.len());
         let mut pos = 0;
+        // Only moves forward as `pos` does, so it is looked for again only once `pos` passes it.
+        let mut held = self.r.held_from(&buf, cut);
         for m in self.r.ac.find_iter(&buf) {
-            if m.start() >= self.r.held_from(&buf, pos.max(cut)) {
+            if pos > held {
+                held = self.r.held_from(&buf, pos);
+            }
+            if m.start() >= held {
                 break;
             }
             out.extend_from_slice(&buf[pos..m.start()]);
@@ -136,7 +140,9 @@ impl Stream {
             self.hits.set(m.pattern().as_usize());
             pos = m.end();
         }
-        let held = self.r.held_from(&buf, pos.max(cut));
+        if pos > held {
+            held = self.r.held_from(&buf, pos);
+        }
         out.extend_from_slice(&buf[pos..held]);
         self.carry = buf[held..].to_vec();
         out
@@ -156,13 +162,12 @@ impl Stream {
 }
 
 pin_project! {
-    /// A body with a `Stream` applied to its data. Trailers come after what was kept back.
+    /// A body with a `Stream` applied to its data. Trailers are dropped: they are not read.
     pub struct Rewrite<B> {
         #[pin]
         inner: B,
         stream: Stream,
         finished: bool,
-        trailers: Option<HeaderMap>,
     }
 }
 
@@ -172,7 +177,6 @@ impl<B> Rewrite<B> {
             inner,
             stream,
             finished: false,
-            trailers: None,
         }
     }
 }
@@ -192,7 +196,7 @@ where
         let mut this = self.project();
         loop {
             if *this.finished {
-                return Poll::Ready(this.trailers.take().map(|t| Ok(Frame::trailers(t))));
+                return Poll::Ready(None);
             }
             match ready!(this.inner.as_mut().poll_frame(cx)) {
                 Some(Ok(frame)) => match frame.into_data() {
@@ -204,7 +208,7 @@ where
                     }
                     Err(frame) => {
                         *this.finished = true;
-                        *this.trailers = frame.into_trailers().ok();
+                        drop(frame);
                         let out = this.stream.finish();
                         if !out.is_empty() {
                             return Poll::Ready(Some(Ok(Frame::data(out.into()))));
@@ -224,7 +228,7 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.finished && self.trailers.is_none()
+        self.finished
     }
 }
 
