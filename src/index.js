@@ -29,7 +29,9 @@ log({ level: 'info', message: 'ca registered', subject: ca.cert.subject });
 
 const config = new Config(api, {
   refreshMs: Number(env.GATEWAY_REFRESH_MS ?? 15_000),
-  resolve6: (host) => dns.resolve6(host),
+  // Every address of a briq's name, either family: Fly's private network is IPv6, a briqyard
+  // tenant's is IPv4.
+  resolve: async (host) => (await dns.lookup(host, { all: true })).map((a) => a.address),
   log,
 });
 await config.start();

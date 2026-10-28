@@ -46,16 +46,16 @@ describe('a briq the gateway does not know yet', () => {
         return { secrets: [], briqs: [{ id: 'bq_new', host: 'new.internal', secrets: [] }] };
       },
     };
-    const resolve6 = async () => {
+    const resolve = async () => {
       if (++lookups <= failures) throw new Error('ENOTFOUND');
       return ['fdaa::7'];
     };
-    return { api, resolve6, configs: () => configs };
+    return { api, resolve, configs: () => configs };
   };
 
   it('waits for its name to resolve, one refresh a second for every connection waiting', async () => {
     const w = world(2);
-    const config = new Config(w.api, { resolve6: w.resolve6, unknownWaitMs: 5_000 });
+    const config = new Config(w.api, { resolve: w.resolve, unknownWaitMs: 5_000 });
     const t0 = Date.now();
     const ids = await Promise.all([config.resolveBriq('fdaa::7'), config.resolveBriq('fdaa::7')]);
     assert.deepEqual(ids, ['bq_new', 'bq_new']);
@@ -65,7 +65,7 @@ describe('a briq the gateway does not know yet', () => {
 
   it('gives up after its wait: no briq, so no secrets', async () => {
     const w = world(Number.POSITIVE_INFINITY);
-    const config = new Config(w.api, { resolve6: w.resolve6, unknownWaitMs: 1_500 });
+    const config = new Config(w.api, { resolve: w.resolve, unknownWaitMs: 1_500 });
     assert.equal(await config.resolveBriq('fdaa::7'), null);
     assert.ok(w.configs() <= 3);
   });
@@ -219,7 +219,7 @@ describe('the gateway', () => {
     const ca = await loadOrCreateCa(join(dir, 'ca'), 'test team');
     await api.registerCa(ca.certPem);
     writeFileSync(join(dir, 'ca.pem'), ca.certPem);
-    config = new Config(api, { refreshMs: 60_000, resolve6: async () => ['::1', '127.0.0.1'] });
+    config = new Config(api, { refreshMs: 60_000, resolve: async () => ['::1', '127.0.0.1'] });
     await config.start();
     events = new Events(api, { flushMs: 60_000 });
     proxy = createProxy(

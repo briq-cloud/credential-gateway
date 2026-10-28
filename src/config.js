@@ -52,15 +52,15 @@ export class Api {
 
 /** The live config, refreshed on a timer; the last good one stays when a fetch fails. */
 export class Config {
-  /** @param {Api} api @param {{ refreshMs?: number, unknownWaitMs?: number, resolve6?: (host: string) => Promise<string[]>, log?: (line: object) => void }} opts */
-  constructor(api, { refreshMs = 15_000, unknownWaitMs = 10_000, resolve6, log = () => {} } = {}) {
+  /** @param {Api} api @param {{ refreshMs?: number, unknownWaitMs?: number, resolve?: (host: string) => Promise<string[]>, log?: (line: object) => void }} opts */
+  constructor(api, { refreshMs = 15_000, unknownWaitMs = 10_000, resolve, log = () => {} } = {}) {
     this.api = api;
     this.refreshMs = refreshMs;
     this.unknownWaitMs = unknownWaitMs;
-    this.resolve6 = resolve6;
+    this.resolve = resolve;
     this.log = log;
     this.secrets = [];
-    /** @type {Map<string, string>} IPv6 address → briq id */
+    /** @type {Map<string, string>} address → briq id */
     this.briqByIp = new Map();
     /** @type {Map<string, Set<string>>} briq id → the names of the team secrets its env names */
     this.secretsByBriq = new Map();
@@ -80,12 +80,12 @@ export class Config {
     this.secretsByBriq = new Map((c.briqs ?? []).map((b) => [b.id, new Set(b.secrets ?? [])]));
     this.ownByBriq = new Map((c.briqs ?? []).map((b) => [b.id, b.own ?? []]));
     this.lastRefreshAt = Date.now();
-    if (this.resolve6) {
+    if (this.resolve) {
       const byIp = new Map();
       await Promise.all(
         (c.briqs ?? []).map(async (b) => {
           try {
-            for (const ip of await this.resolve6(b.host)) byIp.set(normalizeIp(ip), b.id);
+            for (const ip of await this.resolve(b.host)) byIp.set(normalizeIp(ip), b.id);
           } catch {
             // A briq that is not running has no address; it is not sending requests either.
           }
@@ -171,7 +171,7 @@ export class Config {
   }
 }
 
-/** An IPv6 address as Node reports it, without an IPv4-mapped prefix or a zone. */
+/** An address as Node reports it, without an IPv4-mapped prefix or a zone. */
 export function normalizeIp(ip) {
   return ip
     .replace(/^::ffff:/, '')
