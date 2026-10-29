@@ -10,7 +10,9 @@
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_compression::tokio::bufread::{
@@ -32,9 +34,9 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
-use tokio::io::{AsyncBufReadExt, AsyncRead};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::io::{ReaderStream, StreamReader};
 
@@ -65,6 +67,10 @@ pub struct Options {
     pub max_body: usize,
     /// Maximum bodies buffered at once; zero streams every body.
     pub held_bodies: usize,
+    /// Maximum accepted proxy sockets, including headers, upgrades and tunnels.
+    pub max_connections: usize,
+    /// Maximum time for a client to complete TLS after CONNECT.
+    pub handshake_timeout: Duration,
     /// CAs trusted for destinations besides the public roots (tests).
     pub upstream_ca: Vec<CertificateDer<'static>>,
     /// The port intercepted requests are sent to instead of the CONNECT port (tests).
@@ -76,6 +82,8 @@ impl Default for Options {
         Self {
             max_body: 8 * 1024 * 1024,
             held_bodies: 8,
+            max_connections: 1024,
+            handshake_timeout: Duration::from_secs(10),
             upstream_ca: Vec::new(),
             upstream_port: None,
         }
@@ -85,10 +93,86 @@ impl Default for Options {
 /// How long a client has to send a request's headers, the next one on a kept-alive connection
 /// included.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+const HEALTH_CONNECTIONS: usize = 2;
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The admission permit follows the socket when Hyper transfers it into an upgrade.
+/// Holding it in the outer HTTP task would release it before TLS or a tunnel finishes.
+struct LimitedSocket {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsyncRead for LimitedSocket {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for LimitedSocket {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+}
+
+/// Only the local health command may use the reserve; it cannot proxy or keep a socket alive.
+async fn reserved_health(stream: LimitedSocket) {
+    let svc = service_fn(|req: Request<Incoming>| async move {
+        let res = if req.method() == Method::GET
+            && req.uri().path() == "/healthz"
+            && req.uri().scheme().is_none()
+        {
+            text(StatusCode::OK, "ok\n")
+        } else {
+            status(StatusCode::SERVICE_UNAVAILABLE)
+        };
+        Ok::<_, Infallible>(res)
+    });
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEALTH_TIMEOUT)
+        .keep_alive(false);
+    let _ = tokio::time::timeout(
+        HEALTH_TIMEOUT,
+        builder.serve_connection(TokioIo::new(stream), svc),
+    )
+    .await;
+}
 
 pub struct Gateway {
     config: Arc<Config>,
     held: Arc<Semaphore>,
+    connections: Arc<Semaphore>,
+    health_connections: Arc<Semaphore>,
     leafs: Arc<Leafs>,
     events: Arc<Events>,
     opts: Options,
@@ -129,6 +213,8 @@ impl Gateway {
         Arc::new(Self {
             config,
             held: Arc::new(Semaphore::new(opts.held_bodies)),
+            connections: Arc::new(Semaphore::new(opts.max_connections)),
+            health_connections: Arc::new(Semaphore::new(HEALTH_CONNECTIONS)),
             leafs,
             events,
             opts,
@@ -148,7 +234,29 @@ impl Gateway {
                     continue;
                 }
             };
+            let (permit, health_only) = match self.connections.clone().try_acquire_owned() {
+                Ok(permit) => (permit, false),
+                Err(_) => {
+                    // The binary health check connects to 127.0.0.1. IPv4 clients of the
+                    // IPv6 listener arrive as mapped addresses, so canonicalize first.
+                    if !peer.ip().to_canonical().is_loopback() {
+                        continue;
+                    }
+                    match self.health_connections.clone().try_acquire_owned() {
+                        Ok(permit) => (permit, true),
+                        Err(_) => continue,
+                    }
+                }
+            };
             let _ = stream.set_nodelay(true);
+            let stream = LimitedSocket {
+                stream,
+                _permit: permit,
+            };
+            if health_only {
+                tokio::spawn(reserved_health(stream));
+                continue;
+            }
             let gw = self.clone();
             tokio::spawn(async move {
                 let svc = service_fn(move |req| {
@@ -222,9 +330,18 @@ impl Gateway {
             let Ok(upgraded) = on_upgrade.await else {
                 return;
             };
-            let stream = match tls.accept(TokioIo::new(upgraded)).await {
-                Ok(s) => s,
-                Err(err) => {
+            let stream = match tokio::time::timeout(
+                self.opts.handshake_timeout,
+                tls.accept(TokioIo::new(upgraded)),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Err(_) => {
+                    crate::log!(Debug, "client TLS handshake timed out", "host": host);
+                    return;
+                }
+                Ok(Err(err)) => {
                     crate::log!(Debug, "client TLS handshake failed", "host": host, "err": err.to_string());
                     return;
                 }
@@ -316,7 +433,7 @@ impl Gateway {
                     Err(_) => (BytesMut::new(), Some(body)),
                 };
                 match rest {
-                    None => {
+                    None if r.replaced_len(&head, self.opts.max_body).is_some() => {
                         let (out, hits) = r.replace_all(&head);
                         used.extend(names(&in_body, &hits));
                         // A request that had no body (a GET) is sent without one.
@@ -327,6 +444,13 @@ impl Gateway {
                             headers.insert(header::CONTENT_LENGTH, out.len().into());
                         }
                         full(out)
+                    }
+                    None => {
+                        // The input fits, but substitutions would exceed the output budget.
+                        headers.remove(header::CONTENT_LENGTH);
+                        let stream = Stream::new(r);
+                        body_hits = Some(stream.hits());
+                        Rewrite::new(full(head.freeze()), stream).boxed_unsync()
                     }
                     Some(rest) => {
                         headers.remove(header::CONTENT_LENGTH);

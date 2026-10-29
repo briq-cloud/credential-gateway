@@ -69,6 +69,23 @@ impl Replacer {
         (out, hits)
     }
 
+    /// Size after replacement, without allocating output; None exceeds the given budget.
+    pub fn replaced_len(&self, input: &[u8], limit: usize) -> Option<usize> {
+        let mut size = 0usize;
+        let mut pos = 0;
+        for m in self.ac.find_iter(input) {
+            size = size
+                .checked_add(m.start() - pos)?
+                .checked_add(self.to[m.pattern().as_usize()].len())?;
+            if size > limit {
+                return None;
+            }
+            pos = m.end();
+        }
+        size = size.checked_add(input.len() - pos)?;
+        (size <= limit).then_some(size)
+    }
+
     /// The first position from `start` where what is left of `buf` could be the start of a
     /// string (or is one a longer string could continue); `buf.len()` when there is none.
     fn held_from(&self, buf: &[u8], start: usize) -> usize {
@@ -100,7 +117,16 @@ pub struct Stream {
     r: Arc<Replacer>,
     carry: Vec<u8>,
     hits: Hits,
+    input: Bytes,
+    pos: usize,
+    held: usize,
+    replacement: Option<(usize, usize)>,
+    next_match: Option<aho_corasick::Match>,
+    match_ready: bool,
 }
+
+/// Output is emitted before allocating the next frame, even for an expanding replacement.
+const OUTPUT_FRAME_BYTES: usize = 64 * 1024;
 
 impl Stream {
     pub fn new(r: Arc<Replacer>) -> Self {
@@ -109,6 +135,12 @@ impl Stream {
             r,
             carry: Vec::new(),
             hits,
+            input: Bytes::new(),
+            pos: 0,
+            held: 0,
+            replacement: None,
+            next_match: None,
+            match_ready: false,
         }
     }
 
@@ -116,46 +148,113 @@ impl Stream {
         self.hits.clone()
     }
 
-    /// What can be passed on after `chunk`.
+    fn feed(&mut self, chunk: Bytes) {
+        debug_assert!(self.input.is_empty() && self.replacement.is_none());
+        self.input = if self.carry.is_empty() {
+            chunk
+        } else {
+            let mut joined = std::mem::take(&mut self.carry);
+            joined.extend_from_slice(&chunk);
+            joined.into()
+        };
+        self.pos = 0;
+        self.next_match = None;
+        self.match_ready = false;
+        let cut = self.input.len().saturating_sub(self.r.longest - 1);
+        self.held = self.r.held_from(&self.input, cut);
+    }
+
+    fn next_chunk(&mut self) -> Option<Bytes> {
+        loop {
+            if let Some((pattern, offset)) = self.replacement {
+                let value = &self.r.to[pattern];
+                if offset == value.len() {
+                    self.replacement = None;
+                    continue;
+                }
+                let end = offset.saturating_add(OUTPUT_FRAME_BYTES).min(value.len());
+                let out = Bytes::copy_from_slice(&value[offset..end]);
+                self.replacement = Some((pattern, end));
+                return Some(out);
+            }
+            if self.input.is_empty() {
+                return None;
+            }
+            if self.pos > self.held {
+                self.held = self.r.held_from(&self.input, self.pos);
+            }
+            if !self.match_ready {
+                self.next_match = self
+                    .r
+                    .ac
+                    .find(aho_corasick::Input::new(&self.input).span(self.pos..self.input.len()))
+                    .filter(|m| m.start() < self.held);
+                self.match_ready = true;
+            }
+            if let Some(m) = self.next_match {
+                if m.start() == self.pos {
+                    let pattern = m.pattern().as_usize();
+                    self.hits.set(pattern);
+                    self.pos = m.end();
+                    self.next_match = None;
+                    self.match_ready = false;
+                    self.replacement = Some((pattern, 0));
+                    continue;
+                }
+                let end = self.pos.saturating_add(OUTPUT_FRAME_BYTES).min(m.start());
+                let out = self.input.slice(self.pos..end);
+                self.pos = end;
+                return Some(out);
+            }
+            if self.pos < self.held {
+                let end = self.pos.saturating_add(OUTPUT_FRAME_BYTES).min(self.held);
+                let out = self.input.slice(self.pos..end);
+                self.pos = end;
+                return Some(out);
+            }
+            self.carry = self.input[self.held..].to_vec();
+            self.input = Bytes::new();
+            self.pos = 0;
+            self.next_match = None;
+            self.match_ready = false;
+            return None;
+        }
+    }
+
+    fn end(&mut self) {
+        debug_assert!(self.input.is_empty() && self.replacement.is_none());
+        self.input = std::mem::take(&mut self.carry).into();
+        self.pos = 0;
+        self.next_match = None;
+        self.match_ready = false;
+        self.held = self.input.len();
+    }
+
+    fn discard(&mut self) {
+        self.input = Bytes::new();
+        self.carry.clear();
+        self.replacement = None;
+    }
+
+    fn drained(&self) -> bool {
+        self.carry.is_empty() && self.input.is_empty() && self.replacement.is_none()
+    }
+
+    /// Convenience collector for a finite chunk. Body rewriting uses bounded next_chunk.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
-        let mut buf = std::mem::take(&mut self.carry);
-        buf.extend_from_slice(chunk);
-        // A match starting before `cut` fits in `buf` whole, so it is already decided. Past it, a
-        // match is decided when it starts before the held tail: from there, every string that
-        // could match is in `buf` or has already failed.
-        let cut = buf.len().saturating_sub(self.r.longest - 1);
-        let mut out = Vec::with_capacity(buf.len());
-        let mut pos = 0;
-        // Only moves forward as `pos` does, so it is looked for again only once `pos` passes it.
-        let mut held = self.r.held_from(&buf, cut);
-        for m in self.r.ac.find_iter(&buf) {
-            if pos > held {
-                held = self.r.held_from(&buf, pos);
-            }
-            if m.start() >= held {
-                break;
-            }
-            out.extend_from_slice(&buf[pos..m.start()]);
-            out.extend_from_slice(&self.r.to[m.pattern().as_usize()]);
-            self.hits.set(m.pattern().as_usize());
-            pos = m.end();
+        self.feed(Bytes::copy_from_slice(chunk));
+        let mut out = Vec::new();
+        while let Some(part) = self.next_chunk() {
+            out.extend_from_slice(&part);
         }
-        if pos > held {
-            held = self.r.held_from(&buf, pos);
-        }
-        out.extend_from_slice(&buf[pos..held]);
-        self.carry = buf[held..].to_vec();
         out
     }
 
-    /// What is left at the end.
     pub fn finish(&mut self) -> Vec<u8> {
-        let rest = std::mem::take(&mut self.carry);
-        let (out, hits) = self.r.replace_all(&rest);
-        for (i, h) in hits.into_iter().enumerate() {
-            if h {
-                self.hits.set(i);
-            }
+        self.end();
+        let mut out = Vec::new();
+        while let Some(part) = self.next_chunk() {
+            out.extend_from_slice(&part);
         }
         out
     }
@@ -195,40 +294,35 @@ where
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let mut this = self.project();
         loop {
+            if let Some(out) = this.stream.next_chunk() {
+                return Poll::Ready(Some(Ok(Frame::data(out))));
+            }
             if *this.finished {
                 return Poll::Ready(None);
             }
             match ready!(this.inner.as_mut().poll_frame(cx)) {
                 Some(Ok(frame)) => match frame.into_data() {
-                    Ok(data) => {
-                        let out = this.stream.push(&data);
-                        if !out.is_empty() {
-                            return Poll::Ready(Some(Ok(Frame::data(out.into()))));
-                        }
-                    }
-                    Err(frame) => {
+                    Ok(data) => this.stream.feed(data),
+                    Err(_) => {
                         *this.finished = true;
-                        drop(frame);
-                        let out = this.stream.finish();
-                        if !out.is_empty() {
-                            return Poll::Ready(Some(Ok(Frame::data(out.into()))));
-                        }
+                        this.stream.end();
                     }
                 },
-                Some(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
+                Some(Err(e)) => {
+                    *this.finished = true;
+                    this.stream.discard();
+                    return Poll::Ready(Some(Err(e.into())));
+                }
                 None => {
                     *this.finished = true;
-                    let out = this.stream.finish();
-                    if !out.is_empty() {
-                        return Poll::Ready(Some(Ok(Frame::data(out.into()))));
-                    }
+                    this.stream.end();
                 }
             }
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.finished
+        self.finished && self.stream.drained()
     }
 }
 
@@ -307,5 +401,35 @@ mod tests {
         );
         assert_eq!(s.push(b" yy sho"), b"briq_secret_aaaa yy ");
         assert_eq!(s.finish(), b"sho");
+    }
+    #[tokio::test]
+    async fn one_large_replacement_is_emitted_in_bounded_frames() {
+        use http_body_util::{BodyExt, Full};
+        let value = "x".repeat(128 * 1024);
+        let replacer = Arc::new(Replacer::new(&[("a", value.as_str()), ("ab", "z")]).unwrap());
+        let mut body = Rewrite::new(Full::new(Bytes::from_static(b"aa")), Stream::new(replacer));
+        let mut total = 0;
+        let mut frames = 0;
+        while let Some(frame) = body.frame().await {
+            let data = frame.unwrap().into_data().unwrap();
+            assert!(data.len() <= OUTPUT_FRAME_BYTES);
+            assert!(data.iter().all(|&b| b == b'x'));
+            total += data.len();
+            if total < 256 * 1024 {
+                assert!(!body.is_end_stream());
+            }
+            frames += 1;
+        }
+        assert_eq!(total, 256 * 1024);
+        assert_eq!(frames, 4);
+    }
+
+    #[test]
+    fn rewritten_size_is_checked_before_allocation() {
+        let r = Replacer::new(&[("a", "expanded")]).unwrap();
+        assert_eq!(r.replaced_len(b"aa", 16), Some(16));
+        assert_eq!(r.replaced_len(b"aa", 15), None);
+        let mixed = Replacer::new(&[("a", "XX"), ("b", "")]).unwrap();
+        assert_eq!(mixed.replaced_len(b"ab", 2), Some(2));
     }
 }

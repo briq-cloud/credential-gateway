@@ -330,6 +330,34 @@ async fn world_with(state: Option<&Path>) -> World {
 }
 
 async fn world_limits(state: Option<&Path>, held_bodies: usize, max_body: usize) -> World {
+    world_options(state, held_bodies, max_body, Duration::from_secs(10)).await
+}
+
+async fn world_options(
+    state: Option<&Path>,
+    held_bodies: usize,
+    max_body: usize,
+    handshake_timeout: Duration,
+) -> World {
+    world_admission(
+        state,
+        held_bodies,
+        max_body,
+        handshake_timeout,
+        1024,
+        "127.0.0.1",
+    )
+    .await
+}
+
+async fn world_admission(
+    state: Option<&Path>,
+    held_bodies: usize,
+    max_body: usize,
+    handshake_timeout: Duration,
+    max_connections: usize,
+    listen_address: &str,
+) -> World {
     credential_gateway::log::set_level("off");
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tempfile::tempdir().unwrap();
@@ -357,11 +385,13 @@ async fn world_limits(state: Option<&Path>, held_bodies: usize, max_body: usize)
         Options {
             max_body,
             held_bodies,
+            handshake_timeout,
+            max_connections,
             upstream_ca: vec![dest.ca_der.clone()],
             upstream_port: Some(dest.port),
         },
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind((listen_address, 0)).await.unwrap();
     let proxy = listener.local_addr().unwrap().port();
     tokio::spawn(gw.serve(listener));
     World {
@@ -1385,4 +1415,277 @@ async fn stalled_upstream_streams_allow_other_requests_and_recover_after_client_
         ])
         .await;
     assert!(healthy.contains(PLACEHOLDER));
+}
+
+#[tokio::test]
+async fn incomplete_tls_handshakes_expire_and_healthy_clients_still_work() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let w = world_options(None, 2, 1024, Duration::from_millis(100)).await;
+    let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", w.proxy))
+        .await
+        .unwrap();
+    tcp.write_all(b"CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut reply = Vec::new();
+    while !reply.ends_with(b"\r\n\r\n") {
+        reply.push(tcp.read_u8().await.unwrap());
+    }
+    assert!(reply.starts_with(b"HTTP/1.1 200"));
+    tcp.write_all(&[22, 3, 3, 0, 100, 1]).await.unwrap();
+    let mut rest = Vec::new();
+    // Without the gateway deadline this waits forever: the peer never finishes TLS.
+    tokio::time::timeout(Duration::from_secs(2), tcp.read_to_end(&mut rest))
+        .await
+        .unwrap()
+        .unwrap();
+    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let out = w
+        .curl(&[
+            "--max-time",
+            "5",
+            "--cacert",
+            w.cacert(),
+            "-H",
+            &auth,
+            "https://localhost:443/echo",
+        ])
+        .await;
+    assert!(out.contains(PLACEHOLDER));
+    assert!(!out.contains(SECRET));
+}
+
+#[tokio::test]
+async fn amplified_bodies_stream_when_rewritten_output_exceeds_buffer_budget() {
+    let w = world_limits(None, 2, 1024).await;
+    let long_value = "secret-expanded-".repeat(256);
+    w.api.config.lock().unwrap()["secrets"][1]["value"] = json!(long_value);
+    w.config.refresh().await.unwrap();
+    // The input fits in 1KiB, but the rewritten output does not.
+    let input = BODY_PLACEHOLDER.repeat(16);
+    assert!(input.len() < 1024);
+    let out = w
+        .curl(&[
+            "--max-time",
+            "5",
+            "--cacert",
+            w.cacert(),
+            "--data-binary",
+            &input,
+            "https://localhost:443/echo",
+        ])
+        .await;
+    let got = w.received();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].body, long_value.repeat(16).as_bytes());
+    assert!(
+        !got[0].headers.contains_key("content-length"),
+        "amplified output must not be buffered whole"
+    );
+    assert_eq!(got[0].headers["transfer-encoding"], "chunked");
+    assert!(out.contains(BODY_PLACEHOLDER));
+    assert!(!out.contains(&long_value));
+}
+
+async fn admission_head(tcp: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(tcp.read_u8().await.unwrap());
+        }
+        head
+    })
+    .await
+    .unwrap()
+}
+
+async fn admission_connect(w: &World, authority: &str) -> (tokio::net::TcpStream, Vec<u8>) {
+    use tokio::io::AsyncWriteExt;
+    let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", w.proxy))
+        .await
+        .unwrap();
+    tcp.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let head = admission_head(&mut tcp).await;
+    (tcp, head)
+}
+
+async fn admission_health(w: &World) {
+    use tokio::io::AsyncWriteExt;
+    let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", w.proxy))
+        .await
+        .unwrap();
+    tcp.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(admission_head(&mut tcp).await.starts_with(b"HTTP/1.1 200"));
+}
+
+async fn admission_wait_for_release(w: &World) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (tcp, head) = admission_connect(w, "localhost:443").await;
+            drop(tcp);
+            if head.starts_with(b"HTTP/1.1 200") {
+                break;
+            }
+            assert!(head.starts_with(b"HTTP/1.1 503"));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn admission_hold_outer(w: &World) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", w.proxy))
+        .await
+        .unwrap();
+    tcp.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(admission_head(&mut tcp).await.starts_with(b"HTTP/1.1 200"));
+    let mut body = [0; 3];
+    tcp.read_exact(&mut body).await.unwrap();
+    assert_eq!(&body, b"ok\n");
+    // A partial next request must still consume the connection's original permit.
+    tcp.write_all(b"GET /healthz HTTP/1.1\r\nHost:")
+        .await
+        .unwrap();
+    tcp
+}
+
+#[tokio::test]
+async fn admission_counts_outer_headers_and_keeps_local_health_available() {
+    let w = world_admission(None, 2, 1024, Duration::from_secs(10), 1, "127.0.0.1").await;
+    let held = admission_hold_outer(&w).await;
+    admission_health(&w).await;
+    let (_, head) = admission_connect(&w, "localhost:443").await;
+    assert!(
+        head.starts_with(b"HTTP/1.1 503"),
+        "health reserve must not admit CONNECT"
+    );
+    use tokio::io::AsyncWriteExt;
+    let mut plain = tokio::net::TcpStream::connect(("127.0.0.1", w.proxy))
+        .await
+        .unwrap();
+    plain
+        .write_all(b"GET http://localhost/healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(
+        admission_head(&mut plain)
+            .await
+            .starts_with(b"HTTP/1.1 503")
+    );
+    drop(plain);
+    drop(held);
+    admission_wait_for_release(&w).await;
+}
+
+#[tokio::test]
+async fn admission_reserve_is_bounded_and_partial_health_requests_expire() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let w = world_admission(None, 2, 1024, Duration::from_secs(10), 1, "127.0.0.1").await;
+    let _held = admission_hold_outer(&w).await;
+    let mut reserves = Vec::new();
+    for _ in 0..2 {
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", w.proxy))
+            .await
+            .unwrap();
+        tcp.write_all(b"GET /healthz HTTP/1.1\r\nHost:")
+            .await
+            .unwrap();
+        reserves.push(tcp);
+        tokio::task::yield_now().await;
+    }
+    let mut excess = tokio::net::TcpStream::connect(("127.0.0.1", w.proxy))
+        .await
+        .unwrap();
+    let mut byte = [0];
+    let closed = tokio::time::timeout(Duration::from_secs(1), excess.read(&mut byte))
+        .await
+        .unwrap();
+    assert!(
+        matches!(closed, Ok(0) | Err(_)),
+        "reserve must not grow beyond two sockets"
+    );
+    for mut tcp in reserves {
+        let mut bytes = Vec::new();
+        let _closed = tokio::time::timeout(Duration::from_secs(3), tcp.read_to_end(&mut bytes))
+            .await
+            .unwrap();
+    }
+    admission_health(&w).await;
+}
+
+#[tokio::test]
+async fn admission_holds_permit_through_intercepted_tls_stream() {
+    let w = world_admission(None, 2, 1024, Duration::from_secs(10), 1, "127.0.0.1").await;
+    let proxy = format!("http://127.0.0.1:{}", w.proxy);
+    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let mut child = Command::new("curl")
+        .args([
+            "-sS",
+            "-N",
+            "--max-time",
+            "5",
+            "-x",
+            &proxy,
+            "--cacert",
+            w.cacert(),
+            "-H",
+            &auth,
+            "https://localhost:443/stream",
+        ])
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(2), lines.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(line, "data: one\n");
+    let (_, head) = admission_connect(&w, "localhost:443").await;
+    assert!(
+        head.starts_with(b"HTTP/1.1 503"),
+        "upgrade must retain admission permit"
+    );
+    admission_health(&w).await;
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    drop(lines);
+    admission_wait_for_release(&w).await;
+}
+
+#[tokio::test]
+async fn admission_holds_permit_through_raw_tunnel() {
+    let w = world_admission(None, 2, 1024, Duration::from_secs(10), 1, "127.0.0.1").await;
+    let (tunnel, head) = admission_connect(&w, &format!("localhost:{}", w.dest.port)).await;
+    assert!(head.starts_with(b"HTTP/1.1 200"));
+    let (_, head) = admission_connect(&w, "localhost:443").await;
+    assert!(
+        head.starts_with(b"HTTP/1.1 503"),
+        "raw tunnel must retain admission permit"
+    );
+    admission_health(&w).await;
+    drop(tunnel);
+    admission_wait_for_release(&w).await;
+}
+
+#[tokio::test]
+async fn admission_health_reserve_accepts_ipv4_mapped_loopback() {
+    // Like main.rs: an IPv4 loopback client reaches the IPv6 listener as ::ffff:127.0.0.1.
+    let w = world_admission(None, 2, 1024, Duration::from_secs(10), 1, "::").await;
+    let _held = admission_hold_outer(&w).await;
+    admission_health(&w).await;
+    let (_, head) = admission_connect(&w, "localhost:443").await;
+    assert!(head.starts_with(b"HTTP/1.1 503"));
 }
