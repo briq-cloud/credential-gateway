@@ -150,6 +150,10 @@ async fn destination(dir: &Path) -> Destination {
                     });
                     res.body(StreamBody::new(frames).boxed_unsync()).unwrap()
                 }
+                "/amplified-header" => res
+                    .header("x-expanded", "A".repeat(4096))
+                    .body(full("ok"))
+                    .unwrap(),
                 // An upstream dies while echoing a secret across frames.
                 "/broken-stream" => {
                     let go = go.clone();
@@ -1688,4 +1692,75 @@ async fn admission_health_reserve_accepts_ipv4_mapped_loopback() {
     admission_health(&w).await;
     let (_, head) = admission_connect(&w, "localhost:443").await;
     assert!(head.starts_with(b"HTTP/1.1 503"));
+}
+
+#[tokio::test]
+async fn amplified_request_headers_are_rejected_before_sending_secrets() {
+    let w = world().await;
+    w.api.config.lock().unwrap()["secrets"][0]["value"] = json!("x".repeat(4096));
+    w.config.refresh().await.unwrap();
+    let header = format!("Authorization: {}", PLACEHOLDER.repeat(32));
+    let out = w
+        .curl(&[
+            "--max-time",
+            "5",
+            "--cacert",
+            w.cacert(),
+            "-H",
+            &header,
+            "-w",
+            "%{http_code}",
+            "https://localhost:443/echo",
+        ])
+        .await;
+    assert!(out.ends_with("431"), "{out}");
+    assert!(w.received().is_empty());
+}
+
+#[tokio::test]
+async fn amplified_response_headers_fail_closed() {
+    let w = world().await;
+    w.api.config.lock().unwrap()["secrets"][0]["value"] = json!("A");
+    w.config.refresh().await.unwrap();
+    let auth = format!("Authorization: {PLACEHOLDER}");
+    let out = w
+        .curl(&[
+            "--max-time",
+            "5",
+            "--cacert",
+            w.cacert(),
+            "-H",
+            &auth,
+            "-w",
+            "%{http_code}",
+            "https://localhost:443/amplified-header",
+        ])
+        .await;
+    assert!(out.ends_with("502"), "{out}");
+}
+
+#[tokio::test]
+async fn rewritten_headers_share_one_aggregate_budget() {
+    let w = world().await;
+    w.api.config.lock().unwrap()["secrets"][0]["value"] = json!("x".repeat(4096));
+    w.config.refresh().await.unwrap();
+    let one = format!("X-One: {}", PLACEHOLDER.repeat(10));
+    let two = format!("X-Two: {}", PLACEHOLDER.repeat(10));
+    let out = w
+        .curl(&[
+            "--max-time",
+            "5",
+            "--cacert",
+            w.cacert(),
+            "-H",
+            &one,
+            "-H",
+            &two,
+            "-w",
+            "%{http_code}",
+            "https://localhost:443/echo",
+        ])
+        .await;
+    assert!(out.ends_with("431"), "{out}");
+    assert!(w.received().is_empty());
 }

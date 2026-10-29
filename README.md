@@ -101,6 +101,10 @@ and no keep-alive. They keep the local health command available without admittin
 traffic. Other requests using these slots receive 503. The default connection count is a
 generic ceiling, not a recommendation for a particular VM size.
 
+HTTP parsing uses a 64 KiB read-buffer limit. Rewritten header fields (names, values and
+separators) have a separate 64 KiB aggregate budget. Oversized rewritten request fields
+are refused with 431; oversized response fields fail closed with 502.
+
 After CONNECT, a client has 10 seconds to complete its TLS handshake. Incomplete handshakes
 are closed so abandoned clients do not hold their TLS state indefinitely. Streamed responses
 remain open for their full duration.

@@ -93,6 +93,7 @@ impl Default for Options {
 /// How long a client has to send a request's headers, the next one on a kept-alive connection
 /// included.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_HEADER_BYTES: usize = 64 * 1024;
 const HEALTH_CONNECTIONS: usize = 2;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -160,6 +161,8 @@ async fn reserved_health(stream: LimitedSocket) {
     builder
         .timer(TokioTimer::new())
         .header_read_timeout(HEALTH_TIMEOUT)
+        .max_buf_size(MAX_HEADER_BYTES)
+        .max_headers(16)
         .keep_alive(false);
     let _ = tokio::time::timeout(
         HEALTH_TIMEOUT,
@@ -218,8 +221,12 @@ impl Gateway {
             leafs,
             events,
             opts,
-            upstream: Client::builder(TokioExecutor::new()).build(https),
-            plain: Client::builder(TokioExecutor::new()).build(plain),
+            upstream: Client::builder(TokioExecutor::new())
+                .http1_max_buf_size(MAX_HEADER_BYTES)
+                .build(https),
+            plain: Client::builder(TokioExecutor::new())
+                .http1_max_buf_size(MAX_HEADER_BYTES)
+                .build(plain),
         })
     }
 
@@ -266,6 +273,7 @@ impl Gateway {
                 let _ = http1::Builder::new()
                     .timer(TokioTimer::new())
                     .header_read_timeout(HEADER_TIMEOUT)
+                    .max_buf_size(MAX_HEADER_BYTES)
                     .serve_connection(TokioIo::new(stream), svc)
                     .with_upgrades()
                     .await;
@@ -362,6 +370,7 @@ impl Gateway {
             let _ = http1::Builder::new()
                 .timer(TokioTimer::new())
                 .header_read_timeout(HEADER_TIMEOUT)
+                .max_buf_size(MAX_HEADER_BYTES)
                 .serve_connection(TokioIo::new(stream), svc)
                 .await;
         });
@@ -405,14 +414,16 @@ impl Gateway {
         // Headers: every secret that allows them.
         let in_headers: Vec<&Secret> = secrets.iter().filter(|s| s.allows("header")).collect();
         if let Some(r) = replacer(&in_headers, |s| (&s.placeholder, &s.value)) {
-            for v in headers.values_mut() {
-                let (out, hits) = r.replace_all(v.as_bytes());
-                if hits.iter().any(|h| *h) {
-                    *v = HeaderValue::from_bytes(&out)
-                        .map_err(|_| "a secret's value cannot go in a header")?;
-                    used.extend(names(&in_headers, &hits));
+            let hits = match rewrite_headers(&mut headers, &r) {
+                Ok(hits) => hits,
+                Err(_) => {
+                    return Ok(text(
+                        StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                        "rewritten request headers exceed 64 KiB or contain invalid values\n",
+                    ));
                 }
-            }
+            };
+            used.extend(names(&in_headers, &hits));
         }
 
         // The body, for the secrets that allow it: held up to `max_body` to keep its length,
@@ -518,12 +529,7 @@ impl Gateway {
             .status(parts_res.status)
             .body(Empty::new().map_err(never).boxed_unsync())?;
         let mut headers = forward_headers(&parts_res.headers);
-        for v in headers.values_mut() {
-            let (o, hits) = scrub.replace_all(v.as_bytes());
-            if hits.iter().any(|h| *h) {
-                *v = HeaderValue::from_bytes(&o)?;
-            }
-        }
+        rewrite_headers(&mut headers, &scrub)?;
         let st = parts_res.status;
         if parts.method == Method::HEAD
             || st.is_informational()
@@ -705,6 +711,33 @@ fn replacer<'a>(
 ) -> Option<Replacer> {
     let pairs: Vec<(&String, &String)> = secrets.iter().map(|s| pick(s)).collect();
     Replacer::new(&pairs)
+}
+
+/// Check aggregate rewritten size before allocating any header output.
+fn rewrite_headers(headers: &mut HeaderMap, replacer: &Replacer) -> Result<Vec<bool>, BoxError> {
+    let mut size = 2usize;
+    for (name, value) in headers.iter() {
+        let len = replacer
+            .replaced_len(value.as_bytes(), MAX_HEADER_BYTES)
+            .ok_or("rewritten headers exceed 64 KiB")?;
+        size = size
+            .checked_add(name.as_str().len())
+            .and_then(|n| n.checked_add(4))
+            .and_then(|n| n.checked_add(len))
+            .filter(|&n| n <= MAX_HEADER_BYTES)
+            .ok_or("rewritten headers exceed 64 KiB")?;
+    }
+    let mut hits = vec![false; replacer.patterns()];
+    for value in headers.values_mut() {
+        let (out, matched) = replacer.replace_all(value.as_bytes());
+        if matched.iter().any(|&hit| hit) {
+            *value = HeaderValue::from_bytes(&out)?;
+            for (hit, matched) in hits.iter_mut().zip(matched) {
+                *hit |= matched;
+            }
+        }
+    }
+    Ok(hits)
 }
 
 fn names(secrets: &[&Secret], hits: &[bool]) -> Vec<String> {
