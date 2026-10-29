@@ -5,6 +5,8 @@
 //!   GATEWAY_PORT        3128 unless set
 //!   GATEWAY_STATE_DIR   where the CA lives, a volume (/data)
 //!   GATEWAY_REFRESH_MS  how often the config is read again (15000)
+//!   GATEWAY_HELD_BODIES Maximum buffered request bodies (8; zero disables buffering)
+//!   GATEWAY_MAX_BODY_MB Maximum buffered bytes per body, in MiB (8)
 //!   GATEWAY_LOG_LEVEL   debug, info (default), warn, error
 //!
 //! `credential-gateway health` asks a running gateway's /healthz: exit 0 when it answers.
@@ -32,6 +34,31 @@ fn port() -> u16 {
         .unwrap_or(3128)
 }
 
+fn body_options(get: impl Fn(&str) -> Option<String>) -> Result<Options, String> {
+    let read = |name: &str, default: usize| -> Result<usize, String> {
+        match get(name) {
+            None => Ok(default),
+            Some(s) => s
+                .parse()
+                .map_err(|_| format!("{name} must be a nonnegative integer")),
+        }
+    };
+    let held_bodies = read("GATEWAY_HELD_BODIES", 8)?;
+    if held_bodies > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err("GATEWAY_HELD_BODIES exceeds the semaphore limit".into());
+    }
+    let mb = read("GATEWAY_MAX_BODY_MB", 8)?;
+    let max_body = mb
+        .checked_mul(1024 * 1024)
+        .filter(|n| *n > 0 && *n <= isize::MAX as usize)
+        .ok_or("GATEWAY_MAX_BODY_MB must be positive and fit in the address space")?;
+    Ok(Options {
+        held_bodies,
+        max_body,
+        ..Options::default()
+    })
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().nth(1).as_deref() == Some("health") {
@@ -42,6 +69,13 @@ async fn main() {
     let (Some(api_url), Some(token)) = (env("BRIQ_API_URL"), env("BRIQ_GATEWAY_TOKEN")) else {
         credential_gateway::log!(Error, "BRIQ_API_URL and BRIQ_GATEWAY_TOKEN are required");
         std::process::exit(2);
+    };
+    let opts = match body_options(env) {
+        Ok(opts) => opts,
+        Err(err) => {
+            credential_gateway::log!(Error, "invalid body limits", "err": err);
+            std::process::exit(2);
+        }
     };
     let state_dir = PathBuf::from(env("GATEWAY_STATE_DIR").unwrap_or_else(|| "/data".into()));
     let refresh = Duration::from_millis(
@@ -78,7 +112,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let gateway = Gateway::new(config, leafs, events.clone(), Options::default());
+    let gateway = Gateway::new(config, leafs, events.clone(), opts);
 
     let port = port();
     let listener = match TcpListener::bind(("::", port)).await {
@@ -115,4 +149,55 @@ async fn health(port: u16) -> bool {
         .ok()
         .flatten()
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_limits_from_configuration() {
+        let defaults = body_options(|_| None).unwrap();
+        assert_eq!(
+            (defaults.held_bodies, defaults.max_body),
+            (8, 8 * 1024 * 1024)
+        );
+        let smaller = body_options(|name| {
+            Some(
+                if name == "GATEWAY_HELD_BODIES" {
+                    "2"
+                } else {
+                    "4"
+                }
+                .into(),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            (smaller.held_bodies, smaller.max_body),
+            (2, 4 * 1024 * 1024)
+        );
+        let streaming =
+            body_options(|name| (name == "GATEWAY_HELD_BODIES").then(|| "0".into())).unwrap();
+        assert_eq!(streaming.held_bodies, 0);
+    }
+
+    #[test]
+    fn invalid_limits_fail_instead_of_using_defaults() {
+        for name in ["GATEWAY_HELD_BODIES", "GATEWAY_MAX_BODY_MB"] {
+            for value in ["-1", "1.5", "bad", "184467440737095516160"] {
+                assert!(body_options(|key| (key == name).then(|| value.into())).is_err());
+            }
+        }
+        for value in ["0".to_string(), usize::MAX.to_string()] {
+            assert!(
+                body_options(|name| (name == "GATEWAY_MAX_BODY_MB").then(|| value.clone()))
+                    .is_err()
+            );
+        }
+        let too_many = (tokio::sync::Semaphore::MAX_PERMITS + 1).to_string();
+        assert!(
+            body_options(|name| (name == "GATEWAY_HELD_BODIES").then(|| too_many.clone())).is_err()
+        );
+    }
 }

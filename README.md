@@ -78,10 +78,18 @@ stops the gateway rather than being replaced: the team's briqs trust the one the
 | `GATEWAY_PORT` | 3128 |
 | `GATEWAY_STATE_DIR` | Where the CA lives: `/data`, a volume |
 | `GATEWAY_REFRESH_MS` | How often the config is read again: 15000 |
+| `GATEWAY_HELD_BODIES` | Maximum request bodies buffered at once: 8; 0 streams every body |
+| `GATEWAY_MAX_BODY_MB` | Buffer threshold per request body in MiB: 8; positive integer |
 | `GATEWAY_LOG_LEVEL` | `debug`, `info` (default), `warn`, `error` |
 
 `credential-gateway health` asks the running gateway's `/healthz` and exits 0 when it answers
 (the image's `HEALTHCHECK`). Logs are one JSON line per event: `ts`, `level`, `message`, fields.
+
+The body limits control buffering, not the maximum accepted request size. A body over the
+threshold, or arriving while all buffer slots are occupied, is rewritten as a stream and
+sent chunked. Allow memory for TLS connections, rewriting and the runtime in addition to
+`GATEWAY_HELD_BODIES × GATEWAY_MAX_BODY_MB`; that product is not a process memory limit.
+Invalid limits stop startup.
 
 ## The API it talks to
 

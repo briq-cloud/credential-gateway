@@ -296,6 +296,10 @@ struct World {
 
 /// Everything composed as main.rs composes it, the CA in `state` (a new one when empty).
 async fn world_with(state: Option<&Path>) -> World {
+    world_limits(state, 8, 1024).await
+}
+
+async fn world_limits(state: Option<&Path>, held_bodies: usize, max_body: usize) -> World {
     credential_gateway::log::set_level("off");
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tempfile::tempdir().unwrap();
@@ -321,7 +325,8 @@ async fn world_with(state: Option<&Path>) -> World {
         Arc::new(Leafs::new(ca).unwrap()),
         events.clone(),
         Options {
-            max_body: 1024,
+            max_body,
+            held_bodies,
             upstream_ca: vec![dest.ca_der.clone()],
             upstream_port: Some(dest.port),
         },
@@ -1048,4 +1053,27 @@ async fn never_drops_an_event_that_put_a_secret_in() {
         "a made-up method is OTHER"
     );
     assert!(posted.len() <= 1_002, "{}", posted.len());
+}
+
+#[tokio::test]
+async fn body_limits_choose_buffering_or_streaming_without_losing_secrets() {
+    for (held, max, chunked) in [(0, 1024, true), (1, 1024, false), (1, 8, true)] {
+        let w = world_limits(None, held, max).await;
+        let out = w
+            .curl(&[
+                "--cacert",
+                w.cacert(),
+                "--data-binary",
+                BODY_PLACEHOLDER,
+                "https://localhost:443/post",
+            ])
+            .await;
+        let got = w.received();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, BODY_SECRET.as_bytes());
+        assert_eq!(got[0].headers.contains_key("transfer-encoding"), chunked);
+        assert_eq!(got[0].headers.contains_key("content-length"), !chunked);
+        assert!(!out.contains(BODY_SECRET));
+        assert!(out.contains(BODY_PLACEHOLDER));
+    }
 }

@@ -63,6 +63,8 @@ pub struct Options {
     /// A request body to put secrets in is held up to this size, to send it with its length;
     /// a larger one is rewritten as it streams and sent chunked.
     pub max_body: usize,
+    /// Maximum bodies buffered at once; zero streams every body.
+    pub held_bodies: usize,
     /// CAs trusted for destinations besides the public roots (tests).
     pub upstream_ca: Vec<CertificateDer<'static>>,
     /// The port intercepted requests are sent to instead of the CONNECT port (tests).
@@ -73,15 +75,12 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             max_body: 8 * 1024 * 1024,
+            held_bodies: 8,
             upstream_ca: Vec::new(),
             upstream_port: None,
         }
     }
 }
-
-/// How many request bodies may be held at once (each up to `max_body`); past that, a body is
-/// rewritten as it streams instead.
-const HELD_BODIES: usize = 8;
 
 /// How long a client has to send a request's headers, the next one on a kept-alive connection
 /// included.
@@ -129,7 +128,7 @@ impl Gateway {
         plain.set_connect_timeout(Some(Duration::from_secs(10)));
         Arc::new(Self {
             config,
-            held: Arc::new(Semaphore::new(HELD_BODIES)),
+            held: Arc::new(Semaphore::new(opts.held_bodies)),
             leafs,
             events,
             opts,
