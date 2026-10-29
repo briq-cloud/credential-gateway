@@ -150,6 +150,32 @@ async fn destination(dir: &Path) -> Destination {
                     });
                     res.body(StreamBody::new(frames).boxed_unsync()).unwrap()
                 }
+                // An upstream dies while echoing a secret across frames.
+                "/broken-stream" => {
+                    let go = go.clone();
+                    let frames = futures_util::stream::unfold(0, move |state| {
+                        let go = go.clone();
+                        async move {
+                            match state {
+                                0 => Some((
+                                    Ok(Frame::data(Bytes::from(format!(
+                                        "before {}",
+                                        &SECRET[..10]
+                                    )))),
+                                    1,
+                                )),
+                                1 => {
+                                    tokio::time::timeout(Duration::from_secs(5), go.notified())
+                                        .await
+                                        .unwrap();
+                                    Some((Err(BoxError::from("injected upstream reset")), 2))
+                                }
+                                _ => None,
+                            }
+                        }
+                    });
+                    res.body(StreamBody::new(frames).boxed_unsync()).unwrap()
+                }
                 // The real value echoed across two writes.
                 "/split" => {
                     let (a, b) = SECRET.split_at(10);
@@ -215,6 +241,7 @@ struct ApiState {
     events: Mutex<Vec<Value>>,
     configs: AtomicUsize,
     events_down: AtomicBool,
+    config_down: AtomicBool,
     config: Mutex<Value>,
 }
 
@@ -241,6 +268,9 @@ async fn fake_api(config: Value) -> (String, Arc<ApiState>) {
                 }
                 ("GET", "/internal/credential-gateway/config") => {
                     st.configs.fetch_add(1, Ordering::SeqCst);
+                    if st.config_down.load(Ordering::SeqCst) {
+                        return status(StatusCode::SERVICE_UNAVAILABLE);
+                    }
                     Response::new(full(st.config.lock().unwrap().to_string()))
                 }
                 ("POST", "/internal/credential-gateway/events") => {
@@ -1076,4 +1106,283 @@ async fn body_limits_choose_buffering_or_streaming_without_losing_secrets() {
         assert!(!out.contains(BODY_SECRET));
         assert!(out.contains(BODY_PLACEHOLDER));
     }
+}
+
+#[tokio::test]
+async fn config_outage_and_malformed_config_preserve_last_good_then_recover() {
+    let w = world().await;
+    w.api.config_down.store(true, Ordering::SeqCst);
+    assert!(w.config.refresh().await.is_err());
+    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    // Last-known secrets remain usable during a control-plane outage.
+    let out = w
+        .curl(&[
+            "--max-time",
+            "5",
+            "--cacert",
+            w.cacert(),
+            "-H",
+            &auth,
+            "https://localhost:443/echo",
+        ])
+        .await;
+    assert!(out.contains(PLACEHOLDER));
+    assert!(!out.contains(SECRET));
+    w.api.config_down.store(false, Ordering::SeqCst);
+    *w.api.config.lock().unwrap() = json!({"secrets": "broken"});
+    assert!(w.config.refresh().await.is_err());
+    let out = w
+        .curl(&[
+            "--max-time",
+            "5",
+            "--cacert",
+            w.cacert(),
+            "-H",
+            &auth,
+            "https://localhost:443/echo",
+        ])
+        .await;
+    assert!(out.contains(PLACEHOLDER));
+    assert!(!out.contains(SECRET));
+    *w.api.config.lock().unwrap() = team_config();
+    w.api.config.lock().unwrap()["briqs"][0]["secrets"] = json!([]);
+    w.config.refresh().await.unwrap();
+    w.curl(&[
+        "--max-time",
+        "5",
+        "--cacert",
+        w.cacert(),
+        "-H",
+        &auth,
+        "https://localhost:443/echo",
+    ])
+    .await;
+    let got = w.received();
+    assert_eq!(got.len(), 3);
+    assert_eq!(got[0].headers["authorization"], format!("Bearer {SECRET}"));
+    assert_eq!(got[1].headers["authorization"], format!("Bearer {SECRET}"));
+    assert_eq!(
+        got[2].headers["authorization"],
+        format!("Bearer {PLACEHOLDER}")
+    );
+}
+
+#[tokio::test]
+async fn connection_churn_and_aborted_tls_do_not_break_healthy_requests() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let w = world().await;
+    for _ in 0..4 {
+        let attempts = (0..64).map(|_| async {
+            let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", w.proxy))
+                .await
+                .unwrap();
+            tcp.write_all(b"CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n")
+                .await
+                .unwrap();
+            let mut reply = Vec::new();
+            while !reply.ends_with(b"\r\n\r\n") {
+                reply.push(tcp.read_u8().await.unwrap());
+            }
+            assert!(reply.starts_with(b"HTTP/1.1 200"));
+            // Disconnect halfway through a TLS record, before a handshake completes.
+            tcp.write_all(&[22, 3, 3, 0, 100, 1]).await.unwrap();
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            futures_util::future::join_all(attempts),
+        )
+        .await
+        .unwrap();
+        let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+        let out = w
+            .curl(&[
+                "--max-time",
+                "5",
+                "--cacert",
+                w.cacert(),
+                "-H",
+                &auth,
+                "https://localhost:443/echo",
+            ])
+            .await;
+        assert!(out.contains(PLACEHOLDER), "{out}");
+        assert!(!out.contains(SECRET));
+    }
+    assert_eq!(w.received().len(), 4);
+}
+
+#[tokio::test]
+async fn concurrent_body_pressure_keeps_substitution_and_scrubbing_correct() {
+    let w = world_limits(None, 2, 1024).await;
+    let data = format!("{}{BODY_PLACEHOLDER}{}", "x".repeat(4096), "y".repeat(4096));
+    let file = w._dir.path().join("stress.txt");
+    std::fs::write(&file, &data).unwrap();
+    let at = format!("@{}", file.display());
+    let calls = (0..32).map(|_| async {
+        let out = w
+            .curl(&[
+                "--max-time",
+                "10",
+                "--cacert",
+                w.cacert(),
+                "--data-binary",
+                &at,
+                "https://localhost:443/echo",
+            ])
+            .await;
+        assert!(out.contains(BODY_PLACEHOLDER));
+        assert!(!out.contains(BODY_SECRET));
+    });
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        futures_util::future::join_all(calls),
+    )
+    .await
+    .unwrap();
+    let got = w.received();
+    assert_eq!(got.len(), 32);
+    for request in got {
+        assert_eq!(
+            request.body,
+            data.replace(BODY_PLACEHOLDER, BODY_SECRET).as_bytes()
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_upstream_reset_does_not_expose_a_partial_secret_or_poison_later_requests() {
+    let w = world().await;
+    let proxy = format!("http://127.0.0.1:{}", w.proxy);
+    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    use tokio::io::AsyncReadExt;
+    let mut child = Command::new("curl")
+        .args([
+            "-sS",
+            "-N",
+            "--max-time",
+            "5",
+            "--fail",
+            "-x",
+            &proxy,
+            "--cacert",
+            w.cacert(),
+            "-H",
+            &auth,
+            "https://localhost:443/broken-stream",
+        ])
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut safe = [0u8; 7];
+    tokio::time::timeout(Duration::from_secs(2), stdout.read_exact(&mut safe))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&safe, b"before ");
+    w.dest.go_on.notify_one();
+    let mut tail = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), stdout.read_to_end(&mut tail))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !child.wait().await.unwrap().success(),
+        "truncated upstream must fail"
+    );
+    let body = String::from_utf8_lossy(&tail);
+    assert!(!body.contains(SECRET));
+    assert!(
+        !body.contains(&SECRET[..10]),
+        "a possible secret prefix must stay withheld: {body}"
+    );
+    let healthy = w
+        .curl(&[
+            "--max-time",
+            "5",
+            "--cacert",
+            w.cacert(),
+            "-H",
+            &auth,
+            "https://localhost:443/echo",
+        ])
+        .await;
+    assert!(healthy.contains(PLACEHOLDER));
+    assert!(!healthy.contains(SECRET));
+}
+
+#[tokio::test]
+async fn stalled_upstream_streams_allow_other_requests_and_recover_after_client_cancellation() {
+    let w = world().await;
+    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let proxy = format!("http://127.0.0.1:{}", w.proxy);
+    let mut children = Vec::new();
+    for _ in 0..16 {
+        children.push(
+            Command::new("curl")
+                .args([
+                    "-sS",
+                    "-N",
+                    "--max-time",
+                    "3",
+                    "-x",
+                    &proxy,
+                    "--cacert",
+                    w.cacert(),
+                    "-H",
+                    &auth,
+                    "https://localhost:443/stream",
+                ])
+                .kill_on_drop(true)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for child in &mut children {
+        let mut lines = BufReader::new(child.stdout.as_mut().unwrap());
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), lines.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "data: one\n");
+    }
+    assert_eq!(
+        w.received().iter().filter(|r| r.uri == "/stream").count(),
+        16
+    );
+    let healthy = w
+        .curl(&[
+            "--max-time",
+            "5",
+            "--cacert",
+            w.cacert(),
+            "-H",
+            &auth,
+            "https://localhost:443/echo",
+        ])
+        .await;
+    assert!(healthy.contains(PLACEHOLDER));
+    assert!(!healthy.contains(SECRET));
+    for child in children {
+        let out = child.wait_with_output().await.unwrap();
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(SECRET));
+    }
+    let healthy = w
+        .curl(&[
+            "--max-time",
+            "5",
+            "--cacert",
+            w.cacert(),
+            "-H",
+            &auth,
+            "https://localhost:443/echo",
+        ])
+        .await;
+    assert!(healthy.contains(PLACEHOLDER));
 }
