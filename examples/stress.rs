@@ -34,6 +34,8 @@ struct Config {
     connect_limit: usize,
     rate: f64,
     group: String,
+    stream_events: usize,
+    stream_interval_ms: u64,
     tls: TlsConnector,
 }
 
@@ -82,14 +84,16 @@ struct Events {
     expected: Vec<u8>,
     pending: Vec<u8>,
     count: usize,
+    total: usize,
 }
 impl Events {
-    fn new(direct: bool) -> Self {
+    fn new(direct: bool, total: usize) -> Self {
         Self {
             expected: format!("data: {}\n\n", if direct { SECRET } else { PLACEHOLDER })
                 .into_bytes(),
             pending: Vec::new(),
             count: 0,
+            total,
         }
     }
 
@@ -101,10 +105,10 @@ impl Events {
             }
             if self.pending.ends_with(b"\n\n") {
                 if self.pending == self.expected {
-                    self.count += 1;
-                    if self.count > 30 {
+                    if self.count >= self.total {
                         return Err("too many SSE events".into());
                     }
+                    self.count += 1;
                 } else if self.pending != b": waiting\n\n" || self.count == 0 {
                     return Err("SSE event was not correctly rewritten".into());
                 }
@@ -115,8 +119,12 @@ impl Events {
     }
 
     fn finish(&self) -> Result<(), Error> {
-        if self.count != 30 || !self.pending.is_empty() {
-            return Err(format!("incomplete SSE stream: {}/30 events", self.count).into());
+        if self.count != self.total || !self.pending.is_empty() {
+            return Err(format!(
+                "incomplete SSE stream: {}/{} events",
+                self.count, self.total
+            )
+            .into());
         }
         Ok(())
     }
@@ -146,6 +154,8 @@ impl Stages {
 struct Report {
     error: Option<String>,
     ttft: Option<f64>,
+    events: usize,
+    events_per_second: Option<f64>,
     stages: BTreeMap<&'static str, f64>,
 }
 
@@ -181,6 +191,8 @@ async fn worker(
 ) -> Report {
     let mut stages = Stages::new();
     let mut ttft = None;
+    let mut events = Events::new(cfg.direct, cfg.stream_events);
+    let mut stream_started = None;
     let work = async {
         if cfg.rate > 0.0 {
             tokio::time::sleep(Duration::from_secs_f64(index as f64 / cfg.rate)).await;
@@ -227,6 +239,11 @@ async fn worker(
             )
             .header("x-benchmark-stream-group", &cfg.group)
             .header("x-benchmark-stream-count", cfg.count.to_string())
+            .header("x-benchmark-stream-events", cfg.stream_events.to_string())
+            .header(
+                "x-benchmark-stream-interval-ms",
+                cfg.stream_interval_ms.to_string(),
+            )
             .body(Empty::<Bytes>::new())?;
         let response = tokio::time::timeout(IO_TIMEOUT, sender.send_request(req)).await??;
         if response.status() != StatusCode::OK {
@@ -243,7 +260,6 @@ async fn worker(
         }
         stages.next("first_event");
         let mut body = response.into_body();
-        let mut events = Events::new(cfg.direct);
         let mut active = None;
         while let Some(frame) = tokio::time::timeout(IO_TIMEOUT, body.frame()).await? {
             let frame = frame?;
@@ -251,6 +267,7 @@ async fn worker(
                 events.push(&data)?;
                 if events.count > 0 && active.is_none() {
                     stages.next("stream_read");
+                    stream_started = Some(Instant::now());
                     ttft = Some(started.elapsed().as_secs_f64() * 1000.0);
                     active = Some(ActiveStream::new(&shared, cfg.count));
                     setup.take();
@@ -273,7 +290,37 @@ async fn worker(
     Report {
         error,
         ttft,
+        events: events.count,
+        events_per_second: stream_started
+            .map(|start| events.count as f64 / start.elapsed().as_secs_f64()),
         stages: stages.elapsed,
+    }
+}
+
+// Kept consistent with the request-header limits in the benchmark upstream.
+fn stream_parameters(events: Option<&str>, interval: Option<&str>) -> Result<(usize, u64), Error> {
+    fn integer(value: &str) -> Result<u64, Error> {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("stream parameters must be positive decimal integers".into());
+        }
+        Ok(value.parse()?)
+    }
+    let events = integer(events.unwrap_or("30"))?;
+    let interval = integer(interval.unwrap_or("1000"))?;
+    if !(1..=100000).contains(&events)
+        || !(1..=5000).contains(&interval)
+        || events.checked_mul(interval).is_none_or(|ms| ms > 60000)
+    {
+        return Err("stream parameters exceed fixture bounds (100000 events, 5000ms interval, 60000ms total)".into());
+    }
+    Ok((events as usize, interval))
+}
+
+fn optional_env(name: &str) -> Result<Option<String>, Error> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -309,6 +356,10 @@ async fn main() -> Result<(), Error> {
     {
         return Err("invalid benchmark arguments".into());
     }
+    let events = optional_env("BENCH_STREAM_EVENTS")?;
+    let interval = optional_env("BENCH_STREAM_INTERVAL_MS")?;
+    let (stream_events, stream_interval_ms) =
+        stream_parameters(events.as_deref(), interval.as_deref())?;
     let direct = route == "direct";
     let ca = args.get(8).map(String::as_str).unwrap_or(if direct {
         "/tmp/bench-ca.pem"
@@ -332,6 +383,8 @@ async fn main() -> Result<(), Error> {
     .with_no_client_auth();
     let cfg = Arc::new(Config {
         count,
+        stream_events,
+        stream_interval_ms,
         gateway: args[3].clone(),
         direct_addr: env::var("BENCH_DIRECT_ADDR").unwrap_or_else(|_| "bench.internal:443".into()),
         direct,
@@ -371,12 +424,18 @@ async fn main() -> Result<(), Error> {
     done.store(true, Ordering::Relaxed);
     let lag = monitor.await?;
     let mut completed = 0;
+    let mut received_events = 0;
+    let mut event_rates = Vec::new();
     let mut errors = Vec::new();
     let mut ttft = Vec::new();
     let mut stages: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
     for report in reports {
         match report {
             Ok(report) => {
+                received_events += report.events;
+                if let Some(rate) = report.events_per_second {
+                    event_rates.push(rate);
+                }
                 if let Some(error) = report.error {
                     errors.push(error);
                 } else {
@@ -403,13 +462,16 @@ async fn main() -> Result<(), Error> {
     let error_count = errors.len();
     let stage_ms: BTreeMap<&str, Value> =
         stages.into_iter().map(|(k, v)| (k, summary(v))).collect();
+    let seconds = start.elapsed().as_secs_f64();
     println!(
         "{}",
         json!({
             "client": "rust", "mode": "streams", "route": route, "concurrency": count,
             "connect_limit": limit, "ramp_per_second": rate, "established": stats.established,
             "completed": completed, "peak_active_streams": stats.peak, "all_streams_seconds": stats.overlap.as_secs_f64(),
-            "seconds": start.elapsed().as_secs_f64(), "ttft_ms": summary(ttft), "stage_ms": stage_ms,
+            "seconds": seconds, "stream_events": cfg.stream_events, "stream_interval_ms": cfg.stream_interval_ms,
+            "validated_data_events": received_events, "data_events_per_second": received_events as f64 / seconds,
+            "per_stream_events_per_second": summary(event_rates), "ttft_ms": summary(ttft), "stage_ms": stage_ms,
             "runtime_lag_ms": summary(lag), "io_timeout_s": IO_TIMEOUT.as_secs(), "worker_timeout_s": WORKER_TIMEOUT.as_secs(),
             "error_count": error_count, "errors": errors.into_iter().take(5).collect::<Vec<_>>()
         })
@@ -424,8 +486,46 @@ async fn main() -> Result<(), Error> {
 mod tests {
     use super::*;
     #[test]
+    fn event_parameters_preserve_defaults_and_reject_unbounded_work() {
+        assert_eq!(stream_parameters(None, None).unwrap(), (30, 1000));
+        assert_eq!(
+            stream_parameters(Some("600"), Some("50")).unwrap(),
+            (600, 50)
+        );
+        assert_eq!(
+            stream_parameters(Some("60000"), Some("1")).unwrap(),
+            (60000, 1)
+        );
+        for value in ["", "0", "-1", "+1", "1.5", "bad", "18446744073709551616"] {
+            assert!(stream_parameters(Some(value), Some("1")).is_err());
+            assert!(stream_parameters(Some("1"), Some(value)).is_err());
+        }
+        assert!(stream_parameters(Some("100001"), Some("1")).is_err());
+        assert!(stream_parameters(Some("1"), Some("5001")).is_err());
+        assert!(stream_parameters(Some("600"), Some("101")).is_err());
+    }
+
+    #[test]
+    fn validates_the_configured_event_total_including_token_rate_streams() {
+        for total in [1, 30, 600] {
+            let mut events = Events::new(false, total);
+            let frame = format!("data: {PLACEHOLDER}\n\n");
+            for _ in 0..total - 1 {
+                events.push(frame.as_bytes()).unwrap();
+            }
+            assert!(events.finish().is_err());
+            for part in frame.as_bytes().chunks(3) {
+                events.push(part).unwrap();
+            }
+            events.finish().unwrap();
+            assert_eq!(events.count, total);
+            assert!(events.push(frame.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
     fn validates_split_events_and_heartbeats() {
-        let mut events = Events::new(false);
+        let mut events = Events::new(false, 30);
         let body = format!(
             "data: {PLACEHOLDER}\n\n: waiting\n\n{}",
             format!("data: {PLACEHOLDER}\n\n").repeat(29)
@@ -438,18 +538,18 @@ mod tests {
     }
     #[test]
     fn rejects_leaks_truncation_and_extra_events() {
-        let mut leaked = Events::new(false);
+        let mut leaked = Events::new(false, 30);
         assert!(
             leaked
                 .push(format!("data: {SECRET}\n\n").as_bytes())
                 .is_err()
         );
-        let mut short = Events::new(false);
+        let mut short = Events::new(false, 30);
         short
             .push(format!("data: {PLACEHOLDER}\n\n").as_bytes())
             .unwrap();
         assert!(short.finish().is_err());
-        let mut extra = Events::new(false);
+        let mut extra = Events::new(false, 30);
         assert!(
             extra
                 .push(format!("data: {PLACEHOLDER}\n\n").repeat(31).as_bytes())
@@ -458,7 +558,7 @@ mod tests {
     }
     #[test]
     fn direct_control_requires_the_expected_synthetic_secret() {
-        let mut events = Events::new(true);
+        let mut events = Events::new(true, 30);
         events
             .push(format!("data: {SECRET}\n\n").repeat(30).as_bytes())
             .unwrap();

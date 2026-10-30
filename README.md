@@ -194,10 +194,28 @@ and an optional CA file. Zero setup limit removes the setup concurrency bound; z
 rate disables pacing.
 `BENCH_DIRECT_ADDR` can override the direct fixture address; TLS still verifies `bench.internal`.
 
-Each worker must receive exactly 30 validated data events; fixture waiting heartbeats are
-accepted while its stream group forms. Every requested stream must overlap for at least five
-seconds. JSON output reports completion, overlap, timing and errors; any failed worker or
-insufficient overlap exits nonzero. Network operations have a ten-second deadline and workers
+`BENCH_STREAM_EVENTS` and `BENCH_STREAM_INTERVAL_MS` configure the Rust client's requested
+SSE data-event count and interval (defaults: 30 events, 1000 ms). The client sends them in
+`x-benchmark-stream-events` and `x-benchmark-stream-interval-ms`; the Rust upstream validates
+both per request. Clients without these headers, including overload and fault checks, keep
+the original defaults. Counts are 1–100000, intervals 1–5000 ms, and their product must not
+exceed 60000 ms. The existing 60-second group-formation and 100-second worker deadlines stay
+unchanged; invalid settings fail instead of silently falling back.
+
+For a roughly 30-second token-stream workload at 20 events per second per connection:
+
+```bash
+BENCH_STREAM_EVENTS=600 BENCH_STREAM_INTERVAL_MS=50 \
+  ./target/release/examples/stress streams 100 "$GATEWAY_IP" 8 proxy 16 50 ./gateway-ca.pem
+```
+
+Each worker must receive exactly the configured number of validated data events; fixture
+waiting heartbeats are accepted while its stream group forms. Every requested stream must overlap for at least five
+seconds. JSON output includes requested event parameters, validated data-event counts,
+aggregate observed events per second over the whole run (including setup), and per-stream
+observed rates from the first validated event to completion (including group waiting).
+These count SSE events, not HTTP frames, which may be coalesced. It also reports completion,
+overlap, timing and errors; any failed worker or insufficient overlap exits nonzero. Network operations have a ten-second deadline and workers
 a hundred-second deadline. Compare direct and proxied runs with the same fixture resources
 before drawing conclusions about gateway capacity. The example belongs only in benchmark
 images, never the production gateway image.

@@ -31,8 +31,46 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Body = UnsyncBoxBody<Bytes, Error>;
 type Groups = Arc<Mutex<HashMap<String, Arc<Group>>>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamPlan {
+    events: usize,
+    interval_ms: u64,
+}
+
+impl StreamPlan {
+    fn from_headers(headers: &HeaderMap) -> Result<Self, Error> {
+        fn integer(headers: &HeaderMap, name: &str, default: u64) -> Result<u64, Error> {
+            let mut values = headers.get_all(name).iter();
+            let Some(value) = values.next() else {
+                return Ok(default);
+            };
+            if values.next().is_some() {
+                return Err("duplicate stream parameter".into());
+            }
+            let value = value.to_str()?;
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("stream parameters must be positive decimal integers".into());
+            }
+            Ok(value.parse()?)
+        }
+        let events = integer(headers, "x-benchmark-stream-events", 30)?;
+        let interval_ms = integer(headers, "x-benchmark-stream-interval-ms", 1000)?;
+        if !(1..=100000).contains(&events)
+            || !(1..=5000).contains(&interval_ms)
+            || events.checked_mul(interval_ms).is_none_or(|ms| ms > 60000)
+        {
+            return Err("stream parameters exceed fixture bounds".into());
+        }
+        Ok(Self {
+            events: events as usize,
+            interval_ms,
+        })
+    }
+}
+
 struct Group {
     target: usize,
+    plan: StreamPlan,
     arrived: AtomicUsize,
     ready: watch::Sender<bool>,
 }
@@ -66,6 +104,7 @@ impl Drop for Lease {
 }
 
 fn group(headers: &HeaderMap, groups: &Groups) -> Result<Lease, Error> {
+    let plan = StreamPlan::from_headers(headers)?;
     let key = headers
         .get("x-benchmark-stream-group")
         .map(|v| v.to_str())
@@ -84,6 +123,7 @@ fn group(headers: &HeaderMap, groups: &Groups) -> Result<Lease, Error> {
     let group = if count == 1 {
         Arc::new(Group {
             target: 1,
+            plan,
             arrived: AtomicUsize::new(0),
             ready: watch::channel(false).0,
         })
@@ -94,13 +134,14 @@ fn group(headers: &HeaderMap, groups: &Groups) -> Result<Lease, Error> {
             .or_insert_with(|| {
                 Arc::new(Group {
                     target: count,
+                    plan,
                     arrived: AtomicUsize::new(0),
                     ready: watch::channel(false).0,
                 })
             })
             .clone();
-        if group.target != count {
-            return Err("inconsistent stream group size".into());
+        if group.target != count || group.plan != plan {
+            return Err("inconsistent stream group configuration".into());
         }
         group
     };
@@ -163,9 +204,9 @@ fn sse(lease: Lease) -> Body {
                 Err(_) => return Some((Ok(Frame::data(Bytes::from_static(HEARTBEAT))), state)),
             }
         }
-        // Like the Python fixture: wait one second after every event, including the last.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        if state.emitted == 30 {
+        // Keep the default Python fixture semantics: wait after every event, including the last.
+        tokio::time::sleep(Duration::from_millis(state.lease.group.plan.interval_ms)).await;
+        if state.emitted == state.lease.group.plan.events {
             return None;
         }
         state.emitted += 1;
@@ -358,6 +399,72 @@ mod tests {
         long.push(&data).unwrap();
         assert!(long.push(b"x").is_err());
     }
+    #[test]
+    fn stream_headers_have_bounded_and_unambiguous_parameters() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            StreamPlan::from_headers(&headers).unwrap(),
+            StreamPlan {
+                events: 30,
+                interval_ms: 1000
+            }
+        );
+        headers.insert("x-benchmark-stream-events", "600".parse().unwrap());
+        headers.insert("x-benchmark-stream-interval-ms", "50".parse().unwrap());
+        assert_eq!(
+            StreamPlan::from_headers(&headers).unwrap(),
+            StreamPlan {
+                events: 600,
+                interval_ms: 50
+            }
+        );
+        for name in [
+            "x-benchmark-stream-events",
+            "x-benchmark-stream-interval-ms",
+        ] {
+            for value in ["", "0", "-1", "+1", "1.5", "bad", "18446744073709551616"] {
+                let mut bad = headers.clone();
+                bad.insert(name, value.parse().unwrap());
+                assert!(StreamPlan::from_headers(&bad).is_err());
+            }
+            let mut bad = headers.clone();
+            bad.append(name, "1".parse().unwrap());
+            assert!(StreamPlan::from_headers(&bad).is_err());
+            let mut bad = headers.clone();
+            bad.insert(name, http::HeaderValue::from_bytes(b"\xff").unwrap());
+            assert!(StreamPlan::from_headers(&bad).is_err());
+        }
+        headers.insert("x-benchmark-stream-interval-ms", "101".parse().unwrap());
+        assert!(StreamPlan::from_headers(&headers).is_err());
+        headers.insert("x-benchmark-stream-events", "1".parse().unwrap());
+        headers.insert("x-benchmark-stream-interval-ms", "5001".parse().unwrap());
+        assert!(StreamPlan::from_headers(&headers).is_err());
+        headers.insert("x-benchmark-stream-events", "100001".parse().unwrap());
+        headers.insert("x-benchmark-stream-interval-ms", "1".parse().unwrap());
+        assert!(StreamPlan::from_headers(&headers).is_err());
+    }
+
+    #[tokio::test]
+    async fn configured_stream_emits_exactly_its_event_count() {
+        let groups: Groups = Arc::new(Mutex::new(HashMap::new()));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-benchmark-stream-events", "3".parse().unwrap());
+        headers.insert("x-benchmark-stream-interval-ms", "20".parse().unwrap());
+        let mut body = sse(group(&headers, &groups).unwrap());
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_millis(750), async {
+            for _ in 0..3 {
+                let frame = body.frame().await.unwrap().unwrap();
+                assert_eq!(&frame.into_data().unwrap()[..], EVENT);
+            }
+            assert!(body.frame().await.is_none());
+        })
+        .await
+        .expect("configured interval must replace the one-second default");
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert!(groups.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn group_waits_for_every_peer_and_drops_abandoned_entries() {
         let groups: Groups = Arc::new(Mutex::new(HashMap::new()));
@@ -365,6 +472,10 @@ mod tests {
         headers.insert("x-benchmark-stream-group", "test".parse().unwrap());
         headers.insert("x-benchmark-stream-count", "2".parse().unwrap());
         let first = group(&headers, &groups).unwrap();
+        let mut different = headers.clone();
+        different.insert("x-benchmark-stream-events", "600".parse().unwrap());
+        different.insert("x-benchmark-stream-interval-ms", "50".parse().unwrap());
+        assert!(group(&different, &groups).is_err());
         let second = group(&headers, &groups).unwrap();
         first.arrive();
         assert!(!*first.group.ready.borrow());
