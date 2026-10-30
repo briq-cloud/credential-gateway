@@ -1,5 +1,6 @@
-# Tests, then builds the credential gateway image and pushes it to ghcr.io/briq-cloud/credential-gateway: `latest` and
-# the commit's short sha, on every push to main.
+# Tests, then builds the credential gateway image and pushes it to ghcr.io/briq-cloud/credential-gateway:
+# `latest` and the commit's short sha, on every push to main. briq runs a sha tag, never `latest`:
+# a release reaches it through a change of the pinned tag in briq's API.
 name: build
 
 on:
@@ -17,12 +18,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: 24
-          cache: npm
-      - run: npm ci --no-fund --no-audit
-      - run: npm test
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         if: github.event_name != 'pull_request'

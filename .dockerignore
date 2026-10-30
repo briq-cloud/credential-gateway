@@ -1,5 +1,5 @@
-node_modules
+target
 .git
-test
-README.md
 .github
+tests
+README.md

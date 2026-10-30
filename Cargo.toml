@@ -1,0 +1,53 @@
+[package]
+name = "credential-gateway"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "briq's credential gateway: the proxy a team's briqs reach the internet through, which puts real secrets in on the way out and never lets one in."
+publish = false
+
+[dependencies]
+aho-corasick = "=1.1.5"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "deflate", "brotli", "zstd"] }
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+libc = "0.2"
+pem = "4"
+pin-project-lite = "0.2"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+webpki-roots = "1"
+x509-parser = "0.18"
+rand = "0.9"
+
+[lib]
+name = "credential_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "credential-gateway"
+path = "src/main.rs"
+
+[dev-dependencies]
+flate2 = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["process"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
