@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Method, Request, header};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -80,11 +80,14 @@ pub fn normalize_ip(ip: IpAddr) -> IpAddr {
     ip.to_canonical()
 }
 
+pub const DEFAULT_API_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 /// The briq API's `/internal/credential-gateway/*`, with this gateway's token.
 pub struct Api {
     url: String,
     token: String,
     client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    max_response_bytes: usize,
 }
 
 impl Api {
@@ -98,8 +101,18 @@ impl Api {
         Self {
             url: url.trim_end_matches('/').to_string(),
             token: token.to_string(),
-            client: Client::builder(TokioExecutor::new()).build(https),
+            client: Client::builder(TokioExecutor::new())
+                .pool_max_idle_per_host(2)
+                .http1_max_buf_size(64 * 1024)
+                .build(https),
+            max_response_bytes: DEFAULT_API_RESPONSE_BYTES,
         }
+    }
+
+    /// Maximum bytes collected from one API response, including chunked responses.
+    pub fn with_response_limit(mut self, bytes: usize) -> Self {
+        self.max_response_bytes = bytes;
+        self
     }
 
     async fn call(
@@ -122,7 +135,19 @@ impl Api {
         let work = async {
             let res = self.client.request(req.body(body)?).await?;
             let status = res.status();
-            let bytes = res.into_body().collect().await?.to_bytes();
+            if res
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some_and(|n| n > self.max_response_bytes as u64)
+            {
+                return Err("API response exceeds configured byte limit".into());
+            }
+            let bytes = Limited::new(res.into_body(), self.max_response_bytes)
+                .collect()
+                .await?
+                .to_bytes();
             if !status.is_success() {
                 let text = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).into_owned();
                 return Err(format!("{method} {path}: {} {text}", status.as_u16()).into());
@@ -189,6 +214,24 @@ struct State {
     by_ip: HashMap<IpAddr, String>,
     named: HashMap<String, HashSet<String>>,
     own: HashMap<String, Vec<Secret>>,
+}
+
+impl State {
+    fn selected<'a>(
+        &'a self,
+        host: &'a str,
+        briq: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a Secret> + 'a {
+        let named = briq.and_then(|id| self.named.get(id));
+        let own = briq
+            .filter(|_| named.is_some())
+            .and_then(|id| self.own.get(id));
+        self.secrets
+            .iter()
+            .filter(move |s| named.is_some_and(|names| names.contains(&s.name)))
+            .chain(own.into_iter().flatten())
+            .filter(move |s| s.hosts.iter().any(|p| host_matches(p, host)))
+    }
 }
 
 /// The live config.
@@ -291,20 +334,32 @@ impl Config {
     /// env, and its own, for that host. Naming a secret at run is the grant; a request from no
     /// known briq gets none, and another briq's placeholder passes through as text.
     pub fn for_host(&self, host: &str, briq: Option<&str>) -> Vec<Secret> {
-        let Some(briq) = briq else { return Vec::new() };
-        let state = self.state.read().unwrap().clone();
-        let Some(named) = state.named.get(briq) else {
-            return Vec::new();
-        };
-        let here = |s: &&Secret| s.hosts.iter().any(|p| host_matches(p, host));
-        state
-            .secrets
-            .iter()
-            .filter(|s| named.contains(&s.name))
-            .filter(here)
-            .chain(state.own.get(briq).into_iter().flatten().filter(here))
-            .cloned()
-            .collect()
+        self.for_host_with(host, briq, |_| Ok::<_, std::convert::Infallible>(()))
+            .unwrap()
+            .0
+    }
+
+    /// CONNECT needs only an existence check, never an unbudgeted copy of secret values.
+    pub fn has_for_host(&self, host: &str, briq: Option<&str>) -> bool {
+        self.state
+            .read()
+            .unwrap()
+            .selected(host, briq)
+            .next()
+            .is_some()
+    }
+
+    /// Admit a borrowed selection before copying any secret values. The same locked config
+    /// generation supplies the estimate and the owned values, including after a rotation.
+    pub fn for_host_with<T, E>(
+        &self,
+        host: &str,
+        briq: Option<&str>,
+        admit: impl FnOnce(&mut dyn Iterator<Item = &Secret>) -> Result<T, E>,
+    ) -> Result<(Vec<Secret>, T), E> {
+        let state = self.state.read().unwrap();
+        let permit = admit(&mut state.selected(host, briq))?;
+        Ok((state.selected(host, briq).cloned().collect(), permit))
     }
 
     /// Which briq an address belongs to, when the API told us about it.

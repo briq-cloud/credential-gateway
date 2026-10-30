@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, ready};
 
-use aho_corasick::{AhoCorasick, MatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
 use bytes::Bytes;
 use http_body::{Body, Frame};
 use pin_project_lite::pin_project;
@@ -25,20 +25,32 @@ pub struct Replacer {
 }
 
 impl Replacer {
-    /// `None` when there is nothing to look for (empty strings are left out).
-    pub fn new<F: AsRef<[u8]>, T: AsRef<[u8]>>(pairs: &[(F, T)]) -> Option<Self> {
+    /// `Ok(None)` only when there is nothing to look for (empty strings are left out).
+    /// A matcher construction failure is an error: callers must not bypass secret rewriting.
+    pub fn new<F: AsRef<[u8]>, T: AsRef<[u8]>>(pairs: &[(F, T)]) -> Result<Option<Self>, BoxError> {
+        Self::with_builder(pairs, |pairs| {
+            AhoCorasick::builder()
+                .match_kind(MatchKind::LeftmostLongest)
+                .kind(Some(AhoCorasickKind::ContiguousNFA))
+                .build(pairs.iter().map(|(f, _)| f.as_ref()))
+                .map_err(Into::into)
+        })
+    }
+
+    // Keep error propagation testable without allocating billions of automaton states.
+    fn with_builder<F: AsRef<[u8]>, T: AsRef<[u8]>>(
+        pairs: &[(F, T)],
+        build: impl FnOnce(&[&(F, T)]) -> Result<AhoCorasick, BoxError>,
+    ) -> Result<Option<Self>, BoxError> {
         let pairs: Vec<_> = pairs
             .iter()
             .filter(|(f, _)| !f.as_ref().is_empty())
             .collect();
         if pairs.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let ac = AhoCorasick::builder()
-            .match_kind(MatchKind::LeftmostLongest)
-            .build(pairs.iter().map(|(f, _)| f.as_ref()))
-            .ok()?;
-        Some(Self {
+        let ac = build(&pairs)?;
+        Ok(Some(Self {
             ac,
             from: pairs.iter().map(|(f, _)| f.as_ref().to_vec()).collect(),
             to: pairs.iter().map(|(_, t)| t.as_ref().to_vec()).collect(),
@@ -47,7 +59,7 @@ impl Replacer {
                 .map(|(f, _)| f.as_ref().len())
                 .max()
                 .unwrap_or(1),
-        })
+        }))
     }
 
     pub fn patterns(&self) -> usize {
@@ -67,6 +79,23 @@ impl Replacer {
         }
         out.extend_from_slice(&input[pos..]);
         (out, hits)
+    }
+
+    /// Size after replacement, without allocating output; None exceeds the given budget.
+    pub fn replaced_len(&self, input: &[u8], limit: usize) -> Option<usize> {
+        let mut size = 0usize;
+        let mut pos = 0;
+        for m in self.ac.find_iter(input) {
+            size = size
+                .checked_add(m.start() - pos)?
+                .checked_add(self.to[m.pattern().as_usize()].len())?;
+            if size > limit {
+                return None;
+            }
+            pos = m.end();
+        }
+        size = size.checked_add(input.len() - pos)?;
+        (size <= limit).then_some(size)
     }
 
     /// The first position from `start` where what is left of `buf` could be the start of a
@@ -100,7 +129,16 @@ pub struct Stream {
     r: Arc<Replacer>,
     carry: Vec<u8>,
     hits: Hits,
+    input: Bytes,
+    pos: usize,
+    held: usize,
+    replacement: Option<(usize, usize)>,
+    next_match: Option<aho_corasick::Match>,
+    match_ready: bool,
 }
+
+/// Output is emitted before allocating the next frame, even for an expanding replacement.
+const OUTPUT_FRAME_BYTES: usize = 64 * 1024;
 
 impl Stream {
     pub fn new(r: Arc<Replacer>) -> Self {
@@ -109,6 +147,12 @@ impl Stream {
             r,
             carry: Vec::new(),
             hits,
+            input: Bytes::new(),
+            pos: 0,
+            held: 0,
+            replacement: None,
+            next_match: None,
+            match_ready: false,
         }
     }
 
@@ -116,46 +160,113 @@ impl Stream {
         self.hits.clone()
     }
 
-    /// What can be passed on after `chunk`.
+    fn feed(&mut self, chunk: Bytes) {
+        debug_assert!(self.input.is_empty() && self.replacement.is_none());
+        self.input = if self.carry.is_empty() {
+            chunk
+        } else {
+            let mut joined = std::mem::take(&mut self.carry);
+            joined.extend_from_slice(&chunk);
+            joined.into()
+        };
+        self.pos = 0;
+        self.next_match = None;
+        self.match_ready = false;
+        let cut = self.input.len().saturating_sub(self.r.longest - 1);
+        self.held = self.r.held_from(&self.input, cut);
+    }
+
+    fn next_chunk(&mut self) -> Option<Bytes> {
+        loop {
+            if let Some((pattern, offset)) = self.replacement {
+                let value = &self.r.to[pattern];
+                if offset == value.len() {
+                    self.replacement = None;
+                    continue;
+                }
+                let end = offset.saturating_add(OUTPUT_FRAME_BYTES).min(value.len());
+                let out = Bytes::copy_from_slice(&value[offset..end]);
+                self.replacement = Some((pattern, end));
+                return Some(out);
+            }
+            if self.input.is_empty() {
+                return None;
+            }
+            if self.pos > self.held {
+                self.held = self.r.held_from(&self.input, self.pos);
+            }
+            if !self.match_ready {
+                self.next_match = self
+                    .r
+                    .ac
+                    .find(aho_corasick::Input::new(&self.input).span(self.pos..self.input.len()))
+                    .filter(|m| m.start() < self.held);
+                self.match_ready = true;
+            }
+            if let Some(m) = self.next_match {
+                if m.start() == self.pos {
+                    let pattern = m.pattern().as_usize();
+                    self.hits.set(pattern);
+                    self.pos = m.end();
+                    self.next_match = None;
+                    self.match_ready = false;
+                    self.replacement = Some((pattern, 0));
+                    continue;
+                }
+                let end = self.pos.saturating_add(OUTPUT_FRAME_BYTES).min(m.start());
+                let out = self.input.slice(self.pos..end);
+                self.pos = end;
+                return Some(out);
+            }
+            if self.pos < self.held {
+                let end = self.pos.saturating_add(OUTPUT_FRAME_BYTES).min(self.held);
+                let out = self.input.slice(self.pos..end);
+                self.pos = end;
+                return Some(out);
+            }
+            self.carry = self.input[self.held..].to_vec();
+            self.input = Bytes::new();
+            self.pos = 0;
+            self.next_match = None;
+            self.match_ready = false;
+            return None;
+        }
+    }
+
+    fn end(&mut self) {
+        debug_assert!(self.input.is_empty() && self.replacement.is_none());
+        self.input = std::mem::take(&mut self.carry).into();
+        self.pos = 0;
+        self.next_match = None;
+        self.match_ready = false;
+        self.held = self.input.len();
+    }
+
+    fn discard(&mut self) {
+        self.input = Bytes::new();
+        self.carry.clear();
+        self.replacement = None;
+    }
+
+    fn drained(&self) -> bool {
+        self.carry.is_empty() && self.input.is_empty() && self.replacement.is_none()
+    }
+
+    /// Convenience collector for a finite chunk. Body rewriting uses bounded next_chunk.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
-        let mut buf = std::mem::take(&mut self.carry);
-        buf.extend_from_slice(chunk);
-        // A match starting before `cut` fits in `buf` whole, so it is already decided. Past it, a
-        // match is decided when it starts before the held tail: from there, every string that
-        // could match is in `buf` or has already failed.
-        let cut = buf.len().saturating_sub(self.r.longest - 1);
-        let mut out = Vec::with_capacity(buf.len());
-        let mut pos = 0;
-        // Only moves forward as `pos` does, so it is looked for again only once `pos` passes it.
-        let mut held = self.r.held_from(&buf, cut);
-        for m in self.r.ac.find_iter(&buf) {
-            if pos > held {
-                held = self.r.held_from(&buf, pos);
-            }
-            if m.start() >= held {
-                break;
-            }
-            out.extend_from_slice(&buf[pos..m.start()]);
-            out.extend_from_slice(&self.r.to[m.pattern().as_usize()]);
-            self.hits.set(m.pattern().as_usize());
-            pos = m.end();
+        self.feed(Bytes::copy_from_slice(chunk));
+        let mut out = Vec::new();
+        while let Some(part) = self.next_chunk() {
+            out.extend_from_slice(&part);
         }
-        if pos > held {
-            held = self.r.held_from(&buf, pos);
-        }
-        out.extend_from_slice(&buf[pos..held]);
-        self.carry = buf[held..].to_vec();
         out
     }
 
-    /// What is left at the end.
     pub fn finish(&mut self) -> Vec<u8> {
-        let rest = std::mem::take(&mut self.carry);
-        let (out, hits) = self.r.replace_all(&rest);
-        for (i, h) in hits.into_iter().enumerate() {
-            if h {
-                self.hits.set(i);
-            }
+        self.end();
+        let mut out = Vec::new();
+        while let Some(part) = self.next_chunk() {
+            out.extend_from_slice(&part);
         }
         out
     }
@@ -195,45 +306,50 @@ where
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let mut this = self.project();
         loop {
+            if let Some(out) = this.stream.next_chunk() {
+                return Poll::Ready(Some(Ok(Frame::data(out))));
+            }
             if *this.finished {
                 return Poll::Ready(None);
             }
             match ready!(this.inner.as_mut().poll_frame(cx)) {
                 Some(Ok(frame)) => match frame.into_data() {
-                    Ok(data) => {
-                        let out = this.stream.push(&data);
-                        if !out.is_empty() {
-                            return Poll::Ready(Some(Ok(Frame::data(out.into()))));
-                        }
-                    }
-                    Err(frame) => {
+                    Ok(data) => this.stream.feed(data),
+                    Err(_) => {
                         *this.finished = true;
-                        drop(frame);
-                        let out = this.stream.finish();
-                        if !out.is_empty() {
-                            return Poll::Ready(Some(Ok(Frame::data(out.into()))));
-                        }
+                        this.stream.end();
                     }
                 },
-                Some(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
+                Some(Err(e)) => {
+                    *this.finished = true;
+                    this.stream.discard();
+                    return Poll::Ready(Some(Err(e.into())));
+                }
                 None => {
                     *this.finished = true;
-                    let out = this.stream.finish();
-                    if !out.is_empty() {
-                        return Poll::Ready(Some(Ok(Frame::data(out.into()))));
-                    }
+                    this.stream.end();
                 }
             }
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.finished
+        self.finished && self.stream.drained()
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn response_patterns_use_the_budgeted_nfa_representation() {
+        let pairs: Vec<_> = (0..50)
+            .map(|i| (format!("{i:04}{}", "x".repeat(4092)), "token"))
+            .collect();
+        let r = Replacer::new(&pairs).unwrap().unwrap();
+        assert_eq!(r.ac.kind(), AhoCorasickKind::ContiguousNFA);
+        assert!(r.ac.memory_usage() < 204800 * 128 + 50 * 4096 + 16384);
+    }
     use super::*;
 
     fn replacer() -> Arc<Replacer> {
@@ -243,8 +359,25 @@ mod tests {
                 ("short", "S"),
                 ("real-secret-VALUE-longer", "briq_secret_bbbb"),
             ])
+            .unwrap()
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn matcher_failure_is_not_the_absence_of_secrets() {
+        let result = Replacer::with_builder(&[("real-secret", "placeholder")], |_| {
+            Err("injected matcher construction failure".into())
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("matcher failure would disable response scrubbing"),
+        };
+        assert_eq!(error.to_string(), "injected matcher construction failure");
+        let empty = Replacer::with_builder(&[("", "ignored")], |_| {
+            panic!("no matcher is needed for empty patterns")
+        });
+        assert!(empty.unwrap().is_none());
     }
 
     #[test]
@@ -307,5 +440,39 @@ mod tests {
         );
         assert_eq!(s.push(b" yy sho"), b"briq_secret_aaaa yy ");
         assert_eq!(s.finish(), b"sho");
+    }
+    #[tokio::test]
+    async fn one_large_replacement_is_emitted_in_bounded_frames() {
+        use http_body_util::{BodyExt, Full};
+        let value = "x".repeat(128 * 1024);
+        let replacer = Arc::new(
+            Replacer::new(&[("a", value.as_str()), ("ab", "z")])
+                .unwrap()
+                .unwrap(),
+        );
+        let mut body = Rewrite::new(Full::new(Bytes::from_static(b"aa")), Stream::new(replacer));
+        let mut total = 0;
+        let mut frames = 0;
+        while let Some(frame) = body.frame().await {
+            let data = frame.unwrap().into_data().unwrap();
+            assert!(data.len() <= OUTPUT_FRAME_BYTES);
+            assert!(data.iter().all(|&b| b == b'x'));
+            total += data.len();
+            if total < 256 * 1024 {
+                assert!(!body.is_end_stream());
+            }
+            frames += 1;
+        }
+        assert_eq!(total, 256 * 1024);
+        assert_eq!(frames, 4);
+    }
+
+    #[test]
+    fn rewritten_size_is_checked_before_allocation() {
+        let r = Replacer::new(&[("a", "expanded")]).unwrap().unwrap();
+        assert_eq!(r.replaced_len(b"aa", 16), Some(16));
+        assert_eq!(r.replaced_len(b"aa", 15), None);
+        let mixed = Replacer::new(&[("a", "XX"), ("b", "")]).unwrap().unwrap();
+        assert_eq!(mixed.replaced_len(b"ab", 2), Some(2));
     }
 }

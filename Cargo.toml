@@ -8,7 +8,7 @@ description = "briq's credential gateway: the proxy a team's briqs reach the int
 publish = false
 
 [dependencies]
-aho-corasick = "1.1"
+aho-corasick = "=1.1.5"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "deflate", "brotli", "zstd"] }
 bytes = "1"
 http = "1"
@@ -17,6 +17,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+libc = "0.2"
 pem = "4"
 pin-project-lite = "0.2"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }

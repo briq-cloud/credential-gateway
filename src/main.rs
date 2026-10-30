@@ -5,6 +5,10 @@
 //!   GATEWAY_PORT        3128 unless set
 //!   GATEWAY_STATE_DIR   where the CA lives, a volume (/data)
 //!   GATEWAY_REFRESH_MS  how often the config is read again (15000)
+//!   GATEWAY_HELD_BODIES Maximum buffered request bodies (8; zero disables buffering)
+//!   GATEWAY_MAX_BODY_MB Maximum buffered bytes per body, in MiB (8)
+//!   GATEWAY_MAX_CONNECTIONS Maximum proxy sockets (1024; positive integer)
+//!   GATEWAY_REWRITE_BUDGET_MB Estimated matcher admission budget in MiB (64)
 //!   GATEWAY_LOG_LEVEL   debug, info (default), warn, error
 //!
 //! `credential-gateway health` asks a running gateway's /healthz: exit 0 when it answers.
@@ -32,6 +36,53 @@ fn port() -> u16 {
         .unwrap_or(3128)
 }
 
+fn body_options(get: impl Fn(&str) -> Option<String>) -> Result<Options, String> {
+    let read = |name: &str, default: usize| -> Result<usize, String> {
+        match get(name) {
+            None => Ok(default),
+            Some(s) => s
+                .parse()
+                .map_err(|_| format!("{name} must be a nonnegative integer")),
+        }
+    };
+    let held_bodies = read("GATEWAY_HELD_BODIES", 8)?;
+    if held_bodies > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err("GATEWAY_HELD_BODIES exceeds the semaphore limit".into());
+    }
+    let max_connections = read("GATEWAY_MAX_CONNECTIONS", 1024)?;
+    if max_connections == 0 || max_connections > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err("GATEWAY_MAX_CONNECTIONS must be positive and fit the semaphore limit".into());
+    }
+    let mb = read("GATEWAY_MAX_BODY_MB", 8)?;
+    let max_body = mb
+        .checked_mul(1024 * 1024)
+        .filter(|n| *n > 0 && *n <= isize::MAX as usize)
+        .ok_or("GATEWAY_MAX_BODY_MB must be positive and fit in the address space")?;
+    let rewrite_budget = read("GATEWAY_REWRITE_BUDGET_MB", 64)?
+        .checked_mul(1024 * 1024)
+        .filter(|&n| n > 0 && n <= isize::MAX as usize)
+        .ok_or("GATEWAY_REWRITE_BUDGET_MB must be positive and fit in the address space")?;
+    Ok(Options {
+        rewrite_budget,
+        held_bodies,
+        max_body,
+        max_connections,
+        ..Options::default()
+    })
+}
+
+fn config_response_limit(get: impl Fn(&str) -> Option<String>) -> Result<usize, String> {
+    let mb = match get("GATEWAY_MAX_CONFIG_MB") {
+        None => return Ok(credential_gateway::config::DEFAULT_API_RESPONSE_BYTES),
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| "GATEWAY_MAX_CONFIG_MB must be a positive integer")?,
+    };
+    mb.checked_mul(1024 * 1024)
+        .filter(|&n| n > 0 && n <= isize::MAX as usize)
+        .ok_or_else(|| "GATEWAY_MAX_CONFIG_MB must be positive and fit in the address space".into())
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().nth(1).as_deref() == Some("health") {
@@ -43,6 +94,24 @@ async fn main() {
         credential_gateway::log!(Error, "BRIQ_API_URL and BRIQ_GATEWAY_TOKEN are required");
         std::process::exit(2);
     };
+    let opts = match body_options(env) {
+        Ok(opts) => opts,
+        Err(err) => {
+            credential_gateway::log!(Error, "invalid resource limits", "err": err);
+            std::process::exit(2);
+        }
+    };
+    match credential_gateway::fd::ensure(opts.max_connections) {
+        Ok(limits) if limits.soft != limits.previous_soft => {
+            credential_gateway::log!(Info, "raised file descriptor limit",
+                "previous": limits.previous_soft, "soft": limits.soft, "required": limits.required);
+        }
+        Ok(_) => {}
+        Err(err) => {
+            credential_gateway::log!(Error, "cannot provision proxy file descriptors", "err": err);
+            std::process::exit(2);
+        }
+    }
     let state_dir = PathBuf::from(env("GATEWAY_STATE_DIR").unwrap_or_else(|| "/data".into()));
     let refresh = Duration::from_millis(
         env("GATEWAY_REFRESH_MS")
@@ -60,7 +129,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let api = Arc::new(Api::new(&api_url, &token));
+    let max_response = match config_response_limit(env) {
+        Ok(limit) => limit,
+        Err(err) => {
+            credential_gateway::log!(Error, "invalid API response limit", "err": err);
+            std::process::exit(2);
+        }
+    };
+    let api = Arc::new(Api::new(&api_url, &token).with_response_limit(max_response));
     if let Err(err) = api.register_ca(&ca.cert_pem).await {
         credential_gateway::log!(Error, "the CA could not be registered", "err": err.to_string());
         std::process::exit(1);
@@ -78,7 +154,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let gateway = Gateway::new(config, leafs, events.clone(), Options::default());
+    let gateway = Gateway::new(config, leafs, events.clone(), opts);
 
     let port = port();
     let listener = match TcpListener::bind(("::", port)).await {
@@ -115,4 +191,98 @@ async fn health(port: u16) -> bool {
         .ok()
         .flatten()
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_limits_from_configuration() {
+        let defaults = body_options(|_| None).unwrap();
+        assert_eq!(defaults.max_connections, 1024);
+        assert_eq!(defaults.rewrite_budget, 64 * 1024 * 1024);
+        assert_eq!(
+            (defaults.held_bodies, defaults.max_body),
+            (8, 8 * 1024 * 1024)
+        );
+        let smaller = body_options(|name| {
+            Some(
+                if name == "GATEWAY_HELD_BODIES" {
+                    "2"
+                } else {
+                    "4"
+                }
+                .into(),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            (smaller.held_bodies, smaller.max_body),
+            (2, 4 * 1024 * 1024)
+        );
+        let streaming =
+            body_options(|name| (name == "GATEWAY_HELD_BODIES").then(|| "0".into())).unwrap();
+        assert_eq!(streaming.held_bodies, 0);
+        let limited =
+            body_options(|name| (name == "GATEWAY_MAX_CONNECTIONS").then(|| "2".into())).unwrap();
+        assert_eq!(limited.max_connections, 2);
+    }
+
+    #[test]
+    fn invalid_limits_fail_instead_of_using_defaults() {
+        for name in [
+            "GATEWAY_HELD_BODIES",
+            "GATEWAY_MAX_BODY_MB",
+            "GATEWAY_MAX_CONNECTIONS",
+            "GATEWAY_REWRITE_BUDGET_MB",
+        ] {
+            for value in ["-1", "1.5", "bad", "184467440737095516160"] {
+                assert!(body_options(|key| (key == name).then(|| value.into())).is_err());
+            }
+        }
+        for value in ["0".to_string(), usize::MAX.to_string()] {
+            assert!(
+                body_options(|name| (name == "GATEWAY_MAX_BODY_MB").then(|| value.clone()))
+                    .is_err()
+            );
+        }
+        assert!(
+            body_options(|name| (name == "GATEWAY_MAX_CONNECTIONS").then(|| "0".into())).is_err()
+        );
+        let too_many = (tokio::sync::Semaphore::MAX_PERMITS + 1).to_string();
+        assert!(
+            body_options(|name| (name == "GATEWAY_MAX_CONNECTIONS").then(|| too_many.clone()))
+                .is_err()
+        );
+        assert!(
+            body_options(|name| (name == "GATEWAY_HELD_BODIES").then(|| too_many.clone())).is_err()
+        );
+    }
+    #[test]
+    fn rewrite_budget_is_positive_and_checked() {
+        assert_eq!(
+            body_options(|name| (name == "GATEWAY_REWRITE_BUDGET_MB").then(|| "16".into()))
+                .unwrap()
+                .rewrite_budget,
+            16 * 1024 * 1024
+        );
+        for value in ["0".to_owned(), usize::MAX.to_string()] {
+            assert!(
+                body_options(|name| (name == "GATEWAY_REWRITE_BUDGET_MB").then(|| value.clone()))
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn config_response_byte_limit_is_validated() {
+        assert_eq!(config_response_limit(|_| None).unwrap(), 8 * 1024 * 1024);
+        assert_eq!(
+            config_response_limit(|_| Some("1".into())).unwrap(),
+            1024 * 1024
+        );
+        for value in ["0", "-1", "bad", "1.5", "184467440737095516160"] {
+            assert!(config_response_limit(|_| Some(value.into())).is_err());
+        }
+    }
 }

@@ -10,12 +10,12 @@
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_compression::tokio::bufread::{
-    BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder,
-};
+use async_compression::tokio::bufread::{DeflateDecoder, GzipDecoder, ZlibDecoder};
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, TryStreamExt};
 use http::header::{self, HeaderMap, HeaderValue};
@@ -32,16 +32,18 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
-use tokio::io::{AsyncBufReadExt, AsyncRead};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::BoxError;
+use crate::budget::{Budget, DEFAULT_REWRITE_BUDGET, estimate};
 use crate::ca::Leafs;
 use crate::config::{Config, Secret};
 use crate::events::Events;
+use crate::retained::Retained;
 use crate::rewrite::{Replacer, Rewrite, Stream};
 
 pub type Body = UnsyncBoxBody<Bytes, BoxError>;
@@ -63,6 +65,14 @@ pub struct Options {
     /// A request body to put secrets in is held up to this size, to send it with its length;
     /// a larger one is rewritten as it streams and sent chunked.
     pub max_body: usize,
+    /// Maximum bodies buffered at once; zero streams every body.
+    pub held_bodies: usize,
+    /// Maximum accepted proxy sockets, including headers, upgrades and tunnels.
+    pub max_connections: usize,
+    /// Global estimated matcher construction/retention budget; excess requests get 503.
+    pub rewrite_budget: usize,
+    /// Maximum time for a client to complete TLS after CONNECT.
+    pub handshake_timeout: Duration,
     /// CAs trusted for destinations besides the public roots (tests).
     pub upstream_ca: Vec<CertificateDer<'static>>,
     /// The port intercepted requests are sent to instead of the CONNECT port (tests).
@@ -73,27 +83,107 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             max_body: 8 * 1024 * 1024,
+            held_bodies: 8,
+            max_connections: 1024,
+            rewrite_budget: DEFAULT_REWRITE_BUDGET,
+            handshake_timeout: Duration::from_secs(10),
             upstream_ca: Vec::new(),
             upstream_port: None,
         }
     }
 }
 
-/// How many request bodies may be held at once (each up to `max_body`); past that, a body is
-/// rewritten as it streams instead.
-const HELD_BODIES: usize = 8;
-
 /// How long a client has to send a request's headers, the next one on a kept-alive connection
 /// included.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const HEALTH_CONNECTIONS: usize = 2;
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The admission permit follows the socket when Hyper transfers it into an upgrade.
+/// Holding it in the outer HTTP task would release it before TLS or a tunnel finishes.
+struct LimitedSocket {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsyncRead for LimitedSocket {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for LimitedSocket {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+}
+
+/// Only the local health command may use the reserve; it cannot proxy or keep a socket alive.
+async fn reserved_health(stream: LimitedSocket) {
+    let svc = service_fn(|req: Request<Incoming>| async move {
+        let res = if req.method() == Method::GET
+            && req.uri().path() == "/healthz"
+            && req.uri().scheme().is_none()
+        {
+            text(StatusCode::OK, "ok\n")
+        } else {
+            status(StatusCode::SERVICE_UNAVAILABLE)
+        };
+        Ok::<_, Infallible>(res)
+    });
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEALTH_TIMEOUT)
+        .max_buf_size(MAX_HEADER_BYTES)
+        .max_headers(16)
+        .keep_alive(false);
+    let _ = tokio::time::timeout(
+        HEALTH_TIMEOUT,
+        builder.serve_connection(TokioIo::new(stream), svc),
+    )
+    .await;
+}
 
 pub struct Gateway {
     config: Arc<Config>,
     held: Arc<Semaphore>,
+    rewrite_budget: Arc<Budget>,
+    connections: Arc<Semaphore>,
+    health_connections: Arc<Semaphore>,
     leafs: Arc<Leafs>,
     events: Arc<Events>,
     opts: Options,
-    upstream: Client<HttpsConnector<HttpConnector>, Body>,
+    upstream_connector: HttpsConnector<HttpConnector>,
     plain: Client<HttpConnector, Body>,
 }
 
@@ -129,12 +219,18 @@ impl Gateway {
         plain.set_connect_timeout(Some(Duration::from_secs(10)));
         Arc::new(Self {
             config,
-            held: Arc::new(Semaphore::new(HELD_BODIES)),
+            held: Arc::new(Semaphore::new(opts.held_bodies)),
+            rewrite_budget: Budget::new(opts.rewrite_budget),
+            connections: Arc::new(Semaphore::new(opts.max_connections)),
+            health_connections: Arc::new(Semaphore::new(HEALTH_CONNECTIONS)),
             leafs,
             events,
             opts,
-            upstream: Client::builder(TokioExecutor::new()).build(https),
-            plain: Client::builder(TokioExecutor::new()).build(plain),
+            upstream_connector: https,
+            plain: Client::builder(TokioExecutor::new())
+                .pool_max_idle_per_host(0)
+                .http1_max_buf_size(MAX_HEADER_BYTES)
+                .build(plain),
         })
     }
 
@@ -149,7 +245,29 @@ impl Gateway {
                     continue;
                 }
             };
+            let (permit, health_only) = match self.connections.clone().try_acquire_owned() {
+                Ok(permit) => (permit, false),
+                Err(_) => {
+                    // The binary health check connects to 127.0.0.1. IPv4 clients of the
+                    // IPv6 listener arrive as mapped addresses, so canonicalize first.
+                    if !peer.ip().to_canonical().is_loopback() {
+                        continue;
+                    }
+                    match self.health_connections.clone().try_acquire_owned() {
+                        Ok(permit) => (permit, true),
+                        Err(_) => continue,
+                    }
+                }
+            };
             let _ = stream.set_nodelay(true);
+            let stream = LimitedSocket {
+                stream,
+                _permit: permit,
+            };
+            if health_only {
+                tokio::spawn(reserved_health(stream));
+                continue;
+            }
             let gw = self.clone();
             tokio::spawn(async move {
                 let svc = service_fn(move |req| {
@@ -159,6 +277,7 @@ impl Gateway {
                 let _ = http1::Builder::new()
                     .timer(TokioTimer::new())
                     .header_read_timeout(HEADER_TIMEOUT)
+                    .max_buf_size(MAX_HEADER_BYTES)
                     .serve_connection(TokioIo::new(stream), svc)
                     .with_upgrades()
                     .await;
@@ -208,7 +327,7 @@ impl Gateway {
         }
         // Whether to intercept is decided here; which secrets apply is read again for each
         // request, so a revoked or rotated secret stops at the next one, kept-alive or not.
-        if port != 443 || self.config.for_host(&host, briq.as_deref()).is_empty() {
+        if port != 443 || !self.config.has_for_host(&host, briq.as_deref()) {
             return tunnel(req, &host, port).await;
         }
         let tls = match self.leafs.for_host(&host) {
@@ -223,17 +342,36 @@ impl Gateway {
             let Ok(upgraded) = on_upgrade.await else {
                 return;
             };
-            let stream = match tls.accept(TokioIo::new(upgraded)).await {
-                Ok(s) => s,
-                Err(err) => {
+            let stream = match tokio::time::timeout(
+                self.opts.handshake_timeout,
+                tls.accept(TokioIo::new(upgraded)),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Err(_) => {
+                    crate::log!(Debug, "client TLS handshake timed out", "host": host);
+                    return;
+                }
+                Ok(Err(err)) => {
                     crate::log!(Debug, "client TLS handshake failed", "host": host, "err": err.to_string());
                     return;
                 }
             };
+            // Only this CONNECT session owns its fixed-host pool. Dropping the session
+            // closes idle upstream sockets instead of retaining them past admission release.
+            let upstream = Client::builder(TokioExecutor::new())
+                .pool_max_idle_per_host(1)
+                .http1_max_buf_size(MAX_HEADER_BYTES)
+                .build(self.upstream_connector.clone());
             let svc = service_fn(move |req| {
                 let (gw, host, briq) = (self.clone(), host.clone(), briq.clone());
+                let upstream = upstream.clone();
                 async move {
-                    let res = match gw.intercept(req, &host, port, briq.as_deref()).await {
+                    let res = match gw
+                        .intercept(req, &host, port, briq.as_deref(), &upstream)
+                        .await
+                    {
                         Ok(res) => res,
                         Err(err) => {
                             crate::log!(Warn, "request failed", "host": host, "err": err.to_string());
@@ -246,6 +384,7 @@ impl Gateway {
             let _ = http1::Builder::new()
                 .timer(TokioTimer::new())
                 .header_read_timeout(HEADER_TIMEOUT)
+                .max_buf_size(MAX_HEADER_BYTES)
                 .serve_connection(TokioIo::new(stream), svc)
                 .await;
         });
@@ -259,8 +398,8 @@ impl Gateway {
         host: &str,
         port: u16,
         briq: Option<&str>,
+        upstream: &Client<HttpsConnector<HttpConnector>, Body>,
     ) -> Result<Response<Body>, BoxError> {
-        let secrets = self.config.for_host(host, briq);
         // The request must address the CONNECT host: a Host naming another site on the same
         // address (a shared CDN) would carry the real value there. An absolute-form target is
         // refused too.
@@ -276,6 +415,29 @@ impl Gateway {
                 &format!("briq credential gateway: the request must address {host}\n"),
             ));
         }
+        let mut audit_charge = Events::estimate(briq, host, req.method().as_str());
+        let (secrets, (reservation, audit)) =
+            match self.config.for_host_with(host, briq, |secrets| {
+                let reservation = {
+                    let mut selected = secrets.inspect(|secret| audit_charge.name(&secret.name));
+                    estimate(&mut selected)
+                        .and_then(|bytes| self.rewrite_budget.reserve(bytes))
+                        .ok_or(())?
+                };
+                let audit = self
+                    .events
+                    .admit_estimated(briq, host, req.method().as_str(), audit_charge)
+                    .map_err(|_| ())?;
+                Ok::<_, ()>((reservation, audit))
+            }) {
+                Ok(admitted) => admitted,
+                Err(()) => {
+                    return Ok(text(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "credential gateway capacity exceeded\n",
+                    ));
+                }
+            };
         let (parts, body) = req.into_parts();
         let mut headers = forward_headers(&parts.headers);
         headers.insert(header::HOST, HeaderValue::from_str(&bracketed(host))?);
@@ -288,36 +450,38 @@ impl Gateway {
         let mut used: Vec<String> = Vec::new();
         // Headers: every secret that allows them.
         let in_headers: Vec<&Secret> = secrets.iter().filter(|s| s.allows("header")).collect();
-        if let Some(r) = replacer(&in_headers, |s| (&s.placeholder, &s.value)) {
-            for v in headers.values_mut() {
-                let (out, hits) = r.replace_all(v.as_bytes());
-                if hits.iter().any(|h| *h) {
-                    *v = HeaderValue::from_bytes(&out)
-                        .map_err(|_| "a secret's value cannot go in a header")?;
-                    used.extend(names(&in_headers, &hits));
+        if let Some(r) = replacer(&in_headers, |s| (&s.placeholder, &s.value))? {
+            let hits = match rewrite_headers(&mut headers, &r) {
+                Ok(hits) => hits,
+                Err(_) => {
+                    return Ok(text(
+                        StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                        "rewritten request headers exceed 64 KiB or contain invalid values\n",
+                    ));
                 }
-            }
+            };
+            used.extend(names(&in_headers, &hits));
         }
 
         // The body, for the secrets that allow it: held up to `max_body` to keep its length,
         // rewritten as it streams past that. Without such a secret it goes on untouched.
         let in_body: Vec<&Secret> = secrets.iter().filter(|s| s.allows("body")).collect();
         let mut body_hits = None;
-        let mut _held = None;
-        let body: Body = match replacer(&in_body, |s| (&s.placeholder, &s.value)) {
+        let mut held = None;
+        let body: Body = match replacer(&in_body, |s| (&s.placeholder, &s.value))? {
             None => boxed(body),
             Some(r) => {
                 let r = Arc::new(r);
                 let (head, rest) = match self.held.clone().try_acquire_owned() {
                     Ok(permit) => {
-                        _held = Some(permit);
+                        held = Some(Arc::new(permit));
                         read_up_to(body, self.opts.max_body).await?
                     }
                     // As many bodies held as allowed: this one streams from its first byte.
                     Err(_) => (BytesMut::new(), Some(body)),
                 };
                 match rest {
-                    None => {
+                    None if r.replaced_len(&head, self.opts.max_body).is_some() => {
                         let (out, hits) = r.replace_all(&head);
                         used.extend(names(&in_body, &hits));
                         // A request that had no body (a GET) is sent without one.
@@ -328,6 +492,13 @@ impl Gateway {
                             headers.insert(header::CONTENT_LENGTH, out.len().into());
                         }
                         full(out)
+                    }
+                    None => {
+                        // The input fits, but substitutions would exceed the output budget.
+                        headers.remove(header::CONTENT_LENGTH);
+                        let stream = Stream::new(r);
+                        body_hits = Some(stream.hits());
+                        Rewrite::new(full(head.freeze()), stream).boxed_unsync()
                     }
                     Some(rest) => {
                         headers.remove(header::CONTENT_LENGTH);
@@ -345,6 +516,15 @@ impl Gateway {
             }
         };
 
+        if let Some(audit) = &audit {
+            audit.used(used);
+            if let Some(hits) = &body_hits {
+                audit.body(
+                    hits.clone(),
+                    in_body.iter().map(|secret| secret.name.as_str()),
+                );
+            }
+        }
         let port = self.opts.upstream_port.unwrap_or(port);
         let path = parts
             .uri
@@ -357,30 +537,27 @@ impl Gateway {
                 "https://{}:{port}{path}",
                 bracketed(host)
             ))?)
-            .body(body)?;
+            .body(Retained::new(body, (reservation.clone(), held, audit.clone())).boxed_unsync())?;
         *up.headers_mut() = headers;
-        let res = self.upstream.request(up).await;
-        drop(_held);
-        if let Some(h) = &body_hits {
-            used.extend(
-                in_body
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| h.get(*i))
-                    .map(|(_, s)| s.name.clone()),
-            );
+        if let Some(audit) = &audit {
+            audit.arm();
         }
-        // A request that failed after it left still carried the values: it is recorded too.
-        let code = res.as_ref().map_or(502, |r| r.status().as_u16());
-        self.events
-            .record(briq, host, parts.method.as_str(), code, used);
+        let res = upstream.request(up).await;
+        // A request that failed after forwarding began still carried the values.
+        let code = res
+            .as_ref()
+            .map_or(502, |response| response.status().as_u16());
+        if let Some(audit) = &audit {
+            audit.finish(code);
+        }
         let res = res?;
 
         // What comes back: a real value, if the destination echoes it, becomes the placeholder
         // again, in headers and body. Every secret that applies to this request, used or not.
         let Some(scrub) = replacer(&secrets.iter().collect::<Vec<_>>(), |s| {
             (&s.value, &s.placeholder)
-        }) else {
+        })?
+        else {
             // No secret applies any more (revoked since the connection opened): nothing to
             // scrub, the response goes on as it came.
             let (p, b) = res.into_parts();
@@ -391,16 +568,16 @@ impl Gateway {
         };
         let scrub = Arc::new(scrub);
         let (parts_res, body) = res.into_parts();
+        // Read original metadata: hop-by-hop filtering must not hide a coded body.
+        let encoding = match response_encoding(&parts_res.headers) {
+            Ok(encoding) => encoding,
+            Err(_) => return Ok(encoding_refusal()),
+        };
         let mut out = Response::builder()
             .status(parts_res.status)
             .body(Empty::new().map_err(never).boxed_unsync())?;
         let mut headers = forward_headers(&parts_res.headers);
-        for v in headers.values_mut() {
-            let (o, hits) = scrub.replace_all(v.as_bytes());
-            if hits.iter().any(|h| *h) {
-                *v = HeaderValue::from_bytes(&o)?;
-            }
-        }
+        rewrite_headers(&mut headers, &scrub)?;
         let st = parts_res.status;
         if parts.method == Method::HEAD
             || st.is_informational()
@@ -412,21 +589,6 @@ impl Gateway {
         }
         // The length changes with what is replaced: the body goes out chunked.
         headers.remove(header::CONTENT_LENGTH);
-        // Every coding of every Content-Encoding header, in order: one at most can be read.
-        let mut codings = Vec::new();
-        for v in headers.get_all(header::CONTENT_ENCODING) {
-            let v = v.to_str().map_err(|_| "an unreadable Content-Encoding")?;
-            codings.extend(
-                v.split(',')
-                    .map(|c| c.trim().to_ascii_lowercase())
-                    .filter(|c| !c.is_empty() && c != "identity"),
-            );
-        }
-        let encoding = match codings.len() {
-            0 => None,
-            1 => codings.pop(),
-            _ => Some(codings.join(", ")),
-        };
         if encoding.is_none() {
             headers.remove(header::CONTENT_ENCODING);
         }
@@ -439,18 +601,12 @@ impl Gateway {
                     headers.remove(header::CONTENT_ENCODING);
                     b
                 }
-                None => {
-                    return Ok(text(
-                        StatusCode::BAD_GATEWAY,
-                        &format!(
-                            "briq credential gateway: a {enc} response from {host} could not be read to scrub it\n"
-                        ),
-                    ));
-                }
+                None => return Ok(encoding_refusal()),
             },
         };
         *out.headers_mut() = headers;
-        *out.body_mut() = Rewrite::new(body, Stream::new(scrub)).boxed_unsync();
+        *out.body_mut() =
+            Retained::new(Rewrite::new(body, Stream::new(scrub)), reservation).boxed_unsync();
         Ok(out)
     }
 
@@ -545,8 +701,51 @@ async fn read_up_to(
     Ok((buf, None))
 }
 
+/// Contradictory hop-by-hop metadata is refused before looking at or decoding a body.
+fn response_encoding(headers: &HeaderMap) -> Result<Option<String>, BoxError> {
+    if headers.get_all(header::CONNECTION).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .any(|name| name.trim().eq_ignore_ascii_case("content-encoding"))
+        })
+    }) {
+        return Err("Connection nominates Content-Encoding".into());
+    }
+    let mut encoding = None;
+    for value in headers.get_all(header::CONTENT_ENCODING) {
+        for coding in value.to_str()?.split(',').map(str::trim) {
+            if coding.is_empty() || coding.eq_ignore_ascii_case("identity") {
+                continue;
+            }
+            let coding = coding.to_ascii_lowercase();
+            if encoding.is_some() || !matches!(coding.as_str(), "gzip" | "x-gzip" | "deflate") {
+                return Err("unsupported response encoding".into());
+            }
+            encoding = Some(coding);
+        }
+    }
+    Ok(encoding)
+}
+
+fn encoding_refusal() -> Response<Body> {
+    text(
+        StatusCode::BAD_GATEWAY,
+        "credential gateway: response encoding cannot be read to scrub it\n",
+    )
+}
+
 /// A compressed body, decompressed as it streams: one encoding, the usual ones.
-async fn decoded(body: Incoming, encoding: &str) -> Option<Body> {
+async fn decoded<B>(body: B, encoding: &str) -> Option<Body>
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    // These codings may request decoder windows larger than a small gateway's memory.
+    // Refuse them (and every unknown coding) before constructing a body reader or decoder.
+    if !matches!(encoding, "gzip" | "x-gzip" | "deflate") {
+        return None;
+    }
     let mut reader = StreamReader::new(BodyDataStream::new(body).map_err(io::Error::other));
     let read: Box<dyn AsyncRead + Send + Unpin> = match encoding {
         "gzip" | "x-gzip" => {
@@ -566,8 +765,6 @@ async fn decoded(body: Incoming, encoding: &str) -> Option<Body> {
                 Box::new(DeflateDecoder::new(reader))
             }
         }
-        "br" => Box::new(BrotliDecoder::new(reader)),
-        "zstd" => Box::new(ZstdDecoder::new(reader)),
         _ => return None,
     };
     let frames = ReaderStream::new(read)
@@ -579,9 +776,36 @@ async fn decoded(body: Incoming, encoding: &str) -> Option<Body> {
 fn replacer<'a>(
     secrets: &[&'a Secret],
     pick: impl Fn(&'a Secret) -> (&'a String, &'a String),
-) -> Option<Replacer> {
+) -> Result<Option<Replacer>, BoxError> {
     let pairs: Vec<(&String, &String)> = secrets.iter().map(|s| pick(s)).collect();
     Replacer::new(&pairs)
+}
+
+/// Check aggregate rewritten size before allocating any header output.
+fn rewrite_headers(headers: &mut HeaderMap, replacer: &Replacer) -> Result<Vec<bool>, BoxError> {
+    let mut size = 2usize;
+    for (name, value) in headers.iter() {
+        let len = replacer
+            .replaced_len(value.as_bytes(), MAX_HEADER_BYTES)
+            .ok_or("rewritten headers exceed 64 KiB")?;
+        size = size
+            .checked_add(name.as_str().len())
+            .and_then(|n| n.checked_add(4))
+            .and_then(|n| n.checked_add(len))
+            .filter(|&n| n <= MAX_HEADER_BYTES)
+            .ok_or("rewritten headers exceed 64 KiB")?;
+    }
+    let mut hits = vec![false; replacer.patterns()];
+    for value in headers.values_mut() {
+        let (out, matched) = replacer.replace_all(value.as_bytes());
+        if matched.iter().any(|&hit| hit) {
+            *value = HeaderValue::from_bytes(&out)?;
+            for (hit, matched) in hits.iter_mut().zip(matched) {
+                *hit |= matched;
+            }
+        }
+    }
+    Ok(hits)
 }
 
 fn names(secrets: &[&Secret], hits: &[bool]) -> Vec<String> {
@@ -647,3 +871,7 @@ fn text(code: StatusCode, body: &str) -> Response<Body> {
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
     r
 }
+
+#[cfg(test)]
+#[path = "proxy/encoding_tests.rs"]
+mod encoding_tests;
