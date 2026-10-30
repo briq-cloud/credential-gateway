@@ -226,6 +226,13 @@ async fn destination(dir: &Path) -> Destination {
                         "body": String::from_utf8_lossy(&body),
                     })
                     .to_string();
+                    // Contradictory hop-by-hop metadata must not hide this coded echo.
+                    if let Some(mode) = parts.headers.get("x-test-connection-encoding") {
+                        res = res.header("connection", "Content-Encoding");
+                        if mode == "duplicate" {
+                            res = res.header("connection", "keep-alive");
+                        }
+                    }
                     // A server that compresses whatever the client asked for.
                     if let Some(enc) = parts.headers.get("x-test-encoding") {
                         res = res.header("content-encoding", enc.clone());

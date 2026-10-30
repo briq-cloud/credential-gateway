@@ -8,3 +8,5 @@ include!("gateway/scenarios/secrets.rs");
 include!("gateway/scenarios/config_and_streaming.rs");
 
 include!("gateway/scenarios/admission_and_budgets.rs");
+
+include!("gateway/scenarios/encoding_bounds.rs");
