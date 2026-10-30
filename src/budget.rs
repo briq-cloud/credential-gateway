@@ -21,6 +21,11 @@ impl Budget {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
     pub(crate) fn reserve(self: &Arc<Self>, bytes: usize) -> Option<Arc<Reservation>> {
         let mut used = self.used.load(Ordering::Relaxed);
         loop {

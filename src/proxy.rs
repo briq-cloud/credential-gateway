@@ -15,9 +15,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_compression::tokio::bufread::{
-    BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder,
-};
+use async_compression::tokio::bufread::{DeflateDecoder, GzipDecoder, ZlibDecoder};
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, TryStreamExt};
 use http::header::{self, HeaderMap, HeaderValue};
@@ -402,19 +400,6 @@ impl Gateway {
         briq: Option<&str>,
         upstream: &Client<HttpsConnector<HttpConnector>, Body>,
     ) -> Result<Response<Body>, BoxError> {
-        let (secrets, reservation) = match self.config.for_host_with(host, briq, |secrets| {
-            estimate(secrets)
-                .and_then(|bytes| self.rewrite_budget.reserve(bytes))
-                .ok_or(())
-        }) {
-            Ok(admitted) => admitted,
-            Err(()) => {
-                return Ok(text(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "credential gateway capacity exceeded\n",
-                ));
-            }
-        };
         // The request must address the CONNECT host: a Host naming another site on the same
         // address (a shared CDN) would carry the real value there. An absolute-form target is
         // refused too.
@@ -430,6 +415,29 @@ impl Gateway {
                 &format!("briq credential gateway: the request must address {host}\n"),
             ));
         }
+        let mut audit_charge = Events::estimate(briq, host, req.method().as_str());
+        let (secrets, (reservation, audit)) =
+            match self.config.for_host_with(host, briq, |secrets| {
+                let reservation = {
+                    let mut selected = secrets.inspect(|secret| audit_charge.name(&secret.name));
+                    estimate(&mut selected)
+                        .and_then(|bytes| self.rewrite_budget.reserve(bytes))
+                        .ok_or(())?
+                };
+                let audit = self
+                    .events
+                    .admit_estimated(briq, host, req.method().as_str(), audit_charge)
+                    .map_err(|_| ())?;
+                Ok::<_, ()>((reservation, audit))
+            }) {
+                Ok(admitted) => admitted,
+                Err(()) => {
+                    return Ok(text(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "credential gateway capacity exceeded\n",
+                    ));
+                }
+            };
         let (parts, body) = req.into_parts();
         let mut headers = forward_headers(&parts.headers);
         headers.insert(header::HOST, HeaderValue::from_str(&bracketed(host))?);
@@ -508,6 +516,15 @@ impl Gateway {
             }
         };
 
+        if let Some(audit) = &audit {
+            audit.used(used);
+            if let Some(hits) = &body_hits {
+                audit.body(
+                    hits.clone(),
+                    in_body.iter().map(|secret| secret.name.as_str()),
+                );
+            }
+        }
         let port = self.opts.upstream_port.unwrap_or(port);
         let path = parts
             .uri
@@ -520,22 +537,19 @@ impl Gateway {
                 "https://{}:{port}{path}",
                 bracketed(host)
             ))?)
-            .body(Retained::new(body, (reservation.clone(), held)).boxed_unsync())?;
+            .body(Retained::new(body, (reservation.clone(), held, audit.clone())).boxed_unsync())?;
         *up.headers_mut() = headers;
-        let res = upstream.request(up).await;
-        if let Some(h) = &body_hits {
-            used.extend(
-                in_body
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| h.get(*i))
-                    .map(|(_, s)| s.name.clone()),
-            );
+        if let Some(audit) = &audit {
+            audit.arm();
         }
-        // A request that failed after it left still carried the values: it is recorded too.
-        let code = res.as_ref().map_or(502, |r| r.status().as_u16());
-        self.events
-            .record(briq, host, parts.method.as_str(), code, used);
+        let res = upstream.request(up).await;
+        // A request that failed after forwarding began still carried the values.
+        let code = res
+            .as_ref()
+            .map_or(502, |response| response.status().as_u16());
+        if let Some(audit) = &audit {
+            audit.finish(code);
+        }
         let res = res?;
 
         // What comes back: a real value, if the destination echoes it, becomes the placeholder
@@ -554,6 +568,11 @@ impl Gateway {
         };
         let scrub = Arc::new(scrub);
         let (parts_res, body) = res.into_parts();
+        // Read original metadata: hop-by-hop filtering must not hide a coded body.
+        let encoding = match response_encoding(&parts_res.headers) {
+            Ok(encoding) => encoding,
+            Err(_) => return Ok(encoding_refusal()),
+        };
         let mut out = Response::builder()
             .status(parts_res.status)
             .body(Empty::new().map_err(never).boxed_unsync())?;
@@ -570,21 +589,6 @@ impl Gateway {
         }
         // The length changes with what is replaced: the body goes out chunked.
         headers.remove(header::CONTENT_LENGTH);
-        // Every coding of every Content-Encoding header, in order: one at most can be read.
-        let mut codings = Vec::new();
-        for v in headers.get_all(header::CONTENT_ENCODING) {
-            let v = v.to_str().map_err(|_| "an unreadable Content-Encoding")?;
-            codings.extend(
-                v.split(',')
-                    .map(|c| c.trim().to_ascii_lowercase())
-                    .filter(|c| !c.is_empty() && c != "identity"),
-            );
-        }
-        let encoding = match codings.len() {
-            0 => None,
-            1 => codings.pop(),
-            _ => Some(codings.join(", ")),
-        };
         if encoding.is_none() {
             headers.remove(header::CONTENT_ENCODING);
         }
@@ -597,14 +601,7 @@ impl Gateway {
                     headers.remove(header::CONTENT_ENCODING);
                     b
                 }
-                None => {
-                    return Ok(text(
-                        StatusCode::BAD_GATEWAY,
-                        &format!(
-                            "briq credential gateway: a {enc} response from {host} could not be read to scrub it\n"
-                        ),
-                    ));
-                }
+                None => return Ok(encoding_refusal()),
             },
         };
         *out.headers_mut() = headers;
@@ -704,8 +701,51 @@ async fn read_up_to(
     Ok((buf, None))
 }
 
+/// Contradictory hop-by-hop metadata is refused before looking at or decoding a body.
+fn response_encoding(headers: &HeaderMap) -> Result<Option<String>, BoxError> {
+    if headers.get_all(header::CONNECTION).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .any(|name| name.trim().eq_ignore_ascii_case("content-encoding"))
+        })
+    }) {
+        return Err("Connection nominates Content-Encoding".into());
+    }
+    let mut encoding = None;
+    for value in headers.get_all(header::CONTENT_ENCODING) {
+        for coding in value.to_str()?.split(',').map(str::trim) {
+            if coding.is_empty() || coding.eq_ignore_ascii_case("identity") {
+                continue;
+            }
+            let coding = coding.to_ascii_lowercase();
+            if encoding.is_some() || !matches!(coding.as_str(), "gzip" | "x-gzip" | "deflate") {
+                return Err("unsupported response encoding".into());
+            }
+            encoding = Some(coding);
+        }
+    }
+    Ok(encoding)
+}
+
+fn encoding_refusal() -> Response<Body> {
+    text(
+        StatusCode::BAD_GATEWAY,
+        "credential gateway: response encoding cannot be read to scrub it\n",
+    )
+}
+
 /// A compressed body, decompressed as it streams: one encoding, the usual ones.
-async fn decoded(body: Incoming, encoding: &str) -> Option<Body> {
+async fn decoded<B>(body: B, encoding: &str) -> Option<Body>
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    // These codings may request decoder windows larger than a small gateway's memory.
+    // Refuse them (and every unknown coding) before constructing a body reader or decoder.
+    if !matches!(encoding, "gzip" | "x-gzip" | "deflate") {
+        return None;
+    }
     let mut reader = StreamReader::new(BodyDataStream::new(body).map_err(io::Error::other));
     let read: Box<dyn AsyncRead + Send + Unpin> = match encoding {
         "gzip" | "x-gzip" => {
@@ -725,8 +765,6 @@ async fn decoded(body: Incoming, encoding: &str) -> Option<Body> {
                 Box::new(DeflateDecoder::new(reader))
             }
         }
-        "br" => Box::new(BrotliDecoder::new(reader)),
-        "zstd" => Box::new(ZstdDecoder::new(reader)),
         _ => return None,
     };
     let frames = ReaderStream::new(read)
@@ -833,3 +871,7 @@ fn text(code: StatusCode, body: &str) -> Response<Body> {
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
     r
 }
+
+#[cfg(test)]
+#[path = "proxy/encoding_tests.rs"]
+mod encoding_tests;

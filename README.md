@@ -27,7 +27,9 @@ One static binary (Rust: tokio, hyper, rustls), a few MB of memory.
   headers; the body too when the secret says so), and sends the request on over its own TLS
   connection to the real host, asking for an uncompressed answer. In the response, a real value
   that applies to the request, if the host echoes it, becomes the placeholder again, in headers
-  and body; a compressed answer is decompressed first, or refused. The request must address the
+  and body; gzip and deflate answers are decompressed first. Brotli, Zstandard, stacked or
+  unknown encodings are refused before constructing a decoder. A response whose `Connection`
+  headers nominate `Content-Encoding` is refused rather than treating coded bytes as plaintext. The request must address the
   CONNECT host: a `Host` naming another site is refused.
 - **Both directions stream.** A response goes on as the host writes it (server-sent events
   included); the gateway only keeps back a tail that could be the start of a real value, until
@@ -42,15 +44,32 @@ One static binary (Rust: tokio, hyper, rustls), a few MB of memory.
   again (at most once a second, shared by every waiting connection); still unknown after that, it
   is tunnelled without secrets. An address two briqs claim gets no secrets either.
 - **Reports** to the briq API which briq used which secret against which host and method,
-  batched and sent every 30 seconds and on shutdown: that is the team's audit log. A batch the
-  API does not take is sent again with the next. A report of a secret put in is never dropped
-  for room.
+  batched and sent every 30 seconds and on shutdown: that is the team's audit log. Before
+  forwarding a request that could carry credentials, the gateway reserves audit capacity;
+  exhausted capacity returns 503 before forwarding. Admitted secret-use reports retain their
+  capacity through pending batches and retries. Optional reports with no secret use may be
+  dropped when their separate budget is full.
 
 The CA is made on the gateway's first boot and kept on its volume; its private key never leaves
 the machine. The API only ever gets the certificate. A CA that is on the volume but cannot be read
 stops the gateway rather than being replaced: the team's briqs trust the one they were given.
 
 ## Limits
+
+Audit admission is capped at 1,024 secret-use leases and 2 MiB of conservatively charged metadata,
+including pending, in-flight, and retry ownership; one request's charge is at most 32 KiB.
+Optional no-secret reports have a separate 1,000-lease/256-KiB ceiling. Actual entries can reach a
+byte ceiling before the count ceiling. This is conservative accounting, not an exact process-RSS
+bound. Flushes are serialized and send at most 64 events and 128 KiB of charged metadata per batch.
+A canceled flush requeues its unsent entries with their existing leases. The library's direct
+`Events::record` returns false on failed admission; credential forwarding uses pre-admission.
+
+The queue is volatile: a process crash can lose undelivered reports. An acknowledgement lost
+on the network can cause a retry of an already accepted batch. Usage is observed at response
+headers or an upstream error; body hits after a very early response are not retrospectively
+added to that report. Canceling an armed request records its observed usage when its last upload
+owner disappears; failures before forwarding do not invent secret use.
+
 
 - HTTPS only, HTTP/1.1 only (the gateway offers no HTTP/2 in the handshake; clients fall back).
 - No WebSocket through an intercepted host: the upgrade is not passed on. A host with no secret
