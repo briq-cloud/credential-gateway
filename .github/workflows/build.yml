@@ -1,21 +1,22 @@
-# Tests, then builds the credential gateway image and pushes it to ghcr.io/briq-cloud/credential-gateway:
-# `latest` and the commit's short sha, on every push to main. briq runs a sha tag, never `latest`:
-# a release reaches it through a change of the pinned tag in briq's API.
+# Test and build each image on its native architecture; publish a combined index on main.
 name: build
-
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
-
 permissions:
   contents: read
   packages: write
-
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,21 +28,64 @@ jobs:
       - run: cargo test --locked
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: sha
         run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@v6
+      - id: image
+        uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/${{ matrix.arch }}
+          push: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
           provenance: false
-          tags: |
-            ghcr.io/briq-cloud/credential-gateway:latest
-            ghcr.io/briq-cloud/credential-gateway:${{ steps.sha.outputs.short }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ghcr.io/briq-cloud/credential-gateway:${{ steps.sha.outputs.short }}-${{ matrix.arch }}
+          cache-from: |
+            type=gha,scope=credential-gateway-${{ matrix.arch }}
+            type=gha
+          cache-to: type=gha,scope=credential-gateway-${{ matrix.arch }},mode=max
+      - name: Record published digest
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p digests
+          printf '%s\n' "$IMAGE_DIGEST" > "digests/${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          name: image-digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          retention-days: 1
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the combined image index
+        env:
+          IMAGE: ghcr.io/briq-cloud/credential-gateway
+        run: |
+          refs=()
+          for arch in amd64 arm64; do
+            digest=$(cat "digests/$arch")
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            refs+=("$IMAGE@$digest")
+          done
+          docker buildx imagetools create \
+            --tag "$IMAGE:latest" --tag "$IMAGE:${GITHUB_SHA::7}" "${refs[@]}"
