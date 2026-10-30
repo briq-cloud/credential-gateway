@@ -179,7 +179,7 @@ pub struct Gateway {
     leafs: Arc<Leafs>,
     events: Arc<Events>,
     opts: Options,
-    upstream: Client<HttpsConnector<HttpConnector>, Body>,
+    upstream_connector: HttpsConnector<HttpConnector>,
     plain: Client<HttpConnector, Body>,
 }
 
@@ -221,10 +221,9 @@ impl Gateway {
             leafs,
             events,
             opts,
-            upstream: Client::builder(TokioExecutor::new())
-                .http1_max_buf_size(MAX_HEADER_BYTES)
-                .build(https),
+            upstream_connector: https,
             plain: Client::builder(TokioExecutor::new())
+                .pool_max_idle_per_host(0)
                 .http1_max_buf_size(MAX_HEADER_BYTES)
                 .build(plain),
         })
@@ -354,10 +353,20 @@ impl Gateway {
                     return;
                 }
             };
+            // Only this CONNECT session owns its fixed-host pool. Dropping the session
+            // closes idle upstream sockets instead of retaining them past admission release.
+            let upstream = Client::builder(TokioExecutor::new())
+                .pool_max_idle_per_host(1)
+                .http1_max_buf_size(MAX_HEADER_BYTES)
+                .build(self.upstream_connector.clone());
             let svc = service_fn(move |req| {
                 let (gw, host, briq) = (self.clone(), host.clone(), briq.clone());
+                let upstream = upstream.clone();
                 async move {
-                    let res = match gw.intercept(req, &host, port, briq.as_deref()).await {
+                    let res = match gw
+                        .intercept(req, &host, port, briq.as_deref(), &upstream)
+                        .await
+                    {
                         Ok(res) => res,
                         Err(err) => {
                             crate::log!(Warn, "request failed", "host": host, "err": err.to_string());
@@ -384,6 +393,7 @@ impl Gateway {
         host: &str,
         port: u16,
         briq: Option<&str>,
+        upstream: &Client<HttpsConnector<HttpConnector>, Body>,
     ) -> Result<Response<Body>, BoxError> {
         let secrets = self.config.for_host(host, briq);
         // The request must address the CONNECT host: a Host naming another site on the same
@@ -493,7 +503,7 @@ impl Gateway {
             ))?)
             .body(body)?;
         *up.headers_mut() = headers;
-        let res = self.upstream.request(up).await;
+        let res = upstream.request(up).await;
         drop(_held);
         if let Some(h) = &body_hits {
             used.extend(

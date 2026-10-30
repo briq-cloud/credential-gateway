@@ -65,6 +65,18 @@ fn body_options(get: impl Fn(&str) -> Option<String>) -> Result<Options, String>
     })
 }
 
+fn config_response_limit(get: impl Fn(&str) -> Option<String>) -> Result<usize, String> {
+    let mb = match get("GATEWAY_MAX_CONFIG_MB") {
+        None => return Ok(credential_gateway::config::DEFAULT_API_RESPONSE_BYTES),
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| "GATEWAY_MAX_CONFIG_MB must be a positive integer")?,
+    };
+    mb.checked_mul(1024 * 1024)
+        .filter(|&n| n > 0 && n <= isize::MAX as usize)
+        .ok_or_else(|| "GATEWAY_MAX_CONFIG_MB must be positive and fit in the address space".into())
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().nth(1).as_deref() == Some("health") {
@@ -83,6 +95,17 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    match credential_gateway::fd::ensure(opts.max_connections) {
+        Ok(limits) if limits.soft != limits.previous_soft => {
+            credential_gateway::log!(Info, "raised file descriptor limit",
+                "previous": limits.previous_soft, "soft": limits.soft, "required": limits.required);
+        }
+        Ok(_) => {}
+        Err(err) => {
+            credential_gateway::log!(Error, "cannot provision proxy file descriptors", "err": err);
+            std::process::exit(2);
+        }
+    }
     let state_dir = PathBuf::from(env("GATEWAY_STATE_DIR").unwrap_or_else(|| "/data".into()));
     let refresh = Duration::from_millis(
         env("GATEWAY_REFRESH_MS")
@@ -100,7 +123,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let api = Arc::new(Api::new(&api_url, &token));
+    let max_response = match config_response_limit(env) {
+        Ok(limit) => limit,
+        Err(err) => {
+            credential_gateway::log!(Error, "invalid API response limit", "err": err);
+            std::process::exit(2);
+        }
+    };
+    let api = Arc::new(Api::new(&api_url, &token).with_response_limit(max_response));
     if let Err(err) = api.register_ca(&ca.cert_pem).await {
         credential_gateway::log!(Error, "the CA could not be registered", "err": err.to_string());
         std::process::exit(1);
@@ -220,5 +250,16 @@ mod tests {
         assert!(
             body_options(|name| (name == "GATEWAY_HELD_BODIES").then(|| too_many.clone())).is_err()
         );
+    }
+    #[test]
+    fn config_response_byte_limit_is_validated() {
+        assert_eq!(config_response_limit(|_| None).unwrap(), 8 * 1024 * 1024);
+        assert_eq!(
+            config_response_limit(|_| Some("1".into())).unwrap(),
+            1024 * 1024
+        );
+        for value in ["0", "-1", "bad", "1.5", "184467440737095516160"] {
+            assert!(config_response_limit(|_| Some(value.into())).is_err());
+        }
     }
 }

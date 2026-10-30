@@ -50,13 +50,42 @@ where
     F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = Response<Body>> + Send + 'static,
 {
+    serve_observed(tls, Arc::new(SocketCounts::default()), handler).await
+}
+
+#[derive(Default)]
+struct SocketCounts {
+    accepted: AtomicUsize,
+    active: AtomicUsize,
+}
+
+struct ActiveSocket(Arc<SocketCounts>);
+impl Drop for ActiveSocket {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+async fn serve_observed<F, Fut>(
+    tls: Option<TlsAcceptor>,
+    counts: Arc<SocketCounts>,
+    handler: F,
+) -> u16
+where
+    F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Response<Body>> + Send + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let (h, tls) = (handler.clone(), tls.clone());
+            counts.accepted.fetch_add(1, Ordering::SeqCst);
+            counts.active.fetch_add(1, Ordering::SeqCst);
+            let active = ActiveSocket(counts.clone());
             tokio::spawn(async move {
+                let _active = active;
                 let svc = service_fn(move |req| {
                     let h = h.clone();
                     async move { Ok::<_, Infallible>(h(req).await) }
@@ -92,6 +121,7 @@ struct Received {
 /// An HTTPS destination with a CA of its own that echoes what it got, and a few special paths.
 struct Destination {
     port: u16,
+    sockets: Arc<SocketCounts>,
     ca_pem: PathBuf,
     ca_der: rustls_pki_types::CertificateDer<'static>,
     received: Arc<Mutex<Vec<Received>>>,
@@ -108,7 +138,8 @@ async fn destination(dir: &Path) -> Destination {
     let received = Arc::new(Mutex::new(Vec::new()));
     let go_on = Arc::new(Notify::new());
     let (rec, go) = (received.clone(), go_on.clone());
-    let port = serve(Some(tls), move |req: Request<Incoming>| {
+    let sockets = Arc::new(SocketCounts::default());
+    let port = serve_observed(Some(tls), sockets.clone(), move |req: Request<Incoming>| {
         let (rec, go) = (rec.clone(), go.clone());
         async move {
             let (parts, body) = req.into_parts();
@@ -231,6 +262,7 @@ async fn destination(dir: &Path) -> Destination {
     .await;
     Destination {
         port,
+        sockets,
         ca_pem,
         ca_der,
         received,
@@ -246,6 +278,7 @@ struct ApiState {
     configs: AtomicUsize,
     events_down: AtomicBool,
     config_down: AtomicBool,
+    config_chunked: AtomicBool,
     config: Mutex<Value>,
 }
 
@@ -275,7 +308,15 @@ async fn fake_api(config: Value) -> (String, Arc<ApiState>) {
                     if st.config_down.load(Ordering::SeqCst) {
                         return status(StatusCode::SERVICE_UNAVAILABLE);
                     }
-                    Response::new(full(st.config.lock().unwrap().to_string()))
+                    let payload = st.config.lock().unwrap().to_string();
+                    if st.config_chunked.load(Ordering::SeqCst) {
+                        let frames = futures_util::stream::iter(vec![Ok::<_, BoxError>(
+                            Frame::data(Bytes::from(payload)),
+                        )]);
+                        Response::new(StreamBody::new(frames).boxed_unsync())
+                    } else {
+                        Response::new(full(payload))
+                    }
                 }
                 ("POST", "/internal/credential-gateway/events") => {
                     if st.events_down.load(Ordering::SeqCst) {
@@ -1763,4 +1804,101 @@ async fn rewritten_headers_share_one_aggregate_budget() {
         .await;
     assert!(out.ends_with("431"), "{out}");
     assert!(w.received().is_empty());
+}
+
+/// A CONNECT session reuses its upstream socket, but does not leave it idle after disconnect.
+#[tokio::test]
+async fn upstream_keepalive_is_scoped_to_the_connect_session() {
+    use hyper::client::conn::http1 as client;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let w = world().await;
+    let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", w.proxy))
+        .await
+        .unwrap();
+    tcp.write_all(b"CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    while !answer.ends_with(b"\r\n\r\n") {
+        answer.push(tcp.read_u8().await.unwrap());
+    }
+    assert!(
+        answer.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&answer)
+    );
+    let mut roots = rustls::RootCertStore::empty();
+    let pem = std::fs::read_to_string(&w.ca_pem).unwrap();
+    let der = pem::parse(pem).unwrap().into_contents();
+    roots
+        .add(rustls_pki_types::CertificateDer::from(der))
+        .unwrap();
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(tls))
+        .connect(name, tcp)
+        .await
+        .unwrap();
+    let (mut send, conn) = client::handshake::<_, Body>(TokioIo::new(stream))
+        .await
+        .unwrap();
+    let driver = tokio::spawn(conn);
+    let req = || {
+        Request::builder()
+            .uri("/kept")
+            .header("host", "localhost")
+            .header("authorization", format!("Bearer {PLACEHOLDER}"))
+            .body(full(""))
+            .unwrap()
+    };
+    send.send_request(req())
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    send.send_request(req())
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        w.dest.sockets.accepted.load(Ordering::SeqCst),
+        1,
+        "successive requests should reuse one upstream TLS connection"
+    );
+    assert_eq!(w.dest.sockets.active.load(Ordering::SeqCst), 1);
+    drop(send);
+    driver.abort();
+    let _ = driver.await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while w.dest.sockets.active.load(Ordering::SeqCst) != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("idle upstream socket outlived its incoming CONNECT session");
+}
+
+#[tokio::test]
+async fn oversized_api_responses_preserve_the_last_good_config() {
+    for chunked in [false, true] {
+        let (url, state) = fake_api(team_config()).await;
+        state.config_chunked.store(chunked, Ordering::SeqCst);
+        let api = Arc::new(Api::new(&url, "gw-token").with_response_limit(2048));
+        let config = Config::new(api, local(), Duration::from_secs(1));
+        config.refresh().await.unwrap();
+        state.config.lock().unwrap()["secrets"][0]["value"] = json!("x".repeat(4096));
+        assert!(config.refresh().await.is_err());
+        let secrets = config.for_host("localhost", Some("bq_test"));
+        assert_eq!(
+            secrets.iter().find(|s| s.name == "TOKEN").unwrap().value,
+            SECRET
+        );
+    }
 }

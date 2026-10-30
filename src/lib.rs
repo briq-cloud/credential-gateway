@@ -5,6 +5,7 @@ pub mod log;
 pub mod ca;
 pub mod config;
 pub mod events;
+pub mod fd;
 pub mod proxy;
 pub mod rewrite;
 

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Method, Request, header};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -80,11 +80,14 @@ pub fn normalize_ip(ip: IpAddr) -> IpAddr {
     ip.to_canonical()
 }
 
+pub const DEFAULT_API_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 /// The briq API's `/internal/credential-gateway/*`, with this gateway's token.
 pub struct Api {
     url: String,
     token: String,
     client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    max_response_bytes: usize,
 }
 
 impl Api {
@@ -98,8 +101,18 @@ impl Api {
         Self {
             url: url.trim_end_matches('/').to_string(),
             token: token.to_string(),
-            client: Client::builder(TokioExecutor::new()).build(https),
+            client: Client::builder(TokioExecutor::new())
+                .pool_max_idle_per_host(2)
+                .http1_max_buf_size(64 * 1024)
+                .build(https),
+            max_response_bytes: DEFAULT_API_RESPONSE_BYTES,
         }
+    }
+
+    /// Maximum bytes collected from one API response, including chunked responses.
+    pub fn with_response_limit(mut self, bytes: usize) -> Self {
+        self.max_response_bytes = bytes;
+        self
     }
 
     async fn call(
@@ -122,7 +135,19 @@ impl Api {
         let work = async {
             let res = self.client.request(req.body(body)?).await?;
             let status = res.status();
-            let bytes = res.into_body().collect().await?.to_bytes();
+            if res
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some_and(|n| n > self.max_response_bytes as u64)
+            {
+                return Err("API response exceeds configured byte limit".into());
+            }
+            let bytes = Limited::new(res.into_body(), self.max_response_bytes)
+                .collect()
+                .await?
+                .to_bytes();
             if !status.is_success() {
                 let text = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).into_owned();
                 return Err(format!("{method} {path}: {} {text}", status.as_u16()).into());

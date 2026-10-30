@@ -81,6 +81,7 @@ stops the gateway rather than being replaced: the team's briqs trust the one the
 | `GATEWAY_HELD_BODIES` | Maximum request bodies buffered at once: 8; 0 streams every body |
 | `GATEWAY_MAX_BODY_MB` | Buffer threshold for input and rewritten request bytes in MiB: 8; positive integer |
 | `GATEWAY_MAX_CONNECTIONS` | Maximum proxy sockets: 1024; positive integer |
+| `GATEWAY_MAX_CONFIG_MB` | Maximum control-API response body in MiB: 8; positive integer |
 | `GATEWAY_LOG_LEVEL` | `debug`, `info` (default), `warn`, `error` |
 
 `credential-gateway health` asks the running gateway's `/healthz` and exits 0 when it answers
@@ -108,6 +109,10 @@ are refused with 431; oversized response fields fail closed with 502.
 After CONNECT, a client has 10 seconds to complete its TLS handshake. Incomplete handshakes
 are closed so abandoned clients do not hold their TLS state indefinitely. Streamed responses
 remain open for their full duration.
+
+Control-API response collection is bounded for both fixed-length and chunked bodies. An
+oversized or malformed config leaves the last good config in use. The API client retains
+at most two idle connections to its fixed origin.
 
 ## The API it talks to
 
@@ -152,6 +157,31 @@ cargo test      # a fake API, a fake HTTPS destination, curl as the client
 cargo clippy --all-targets -- -D warnings
 docker build -t credential-gateway .
 ```
+
+The optional Rust SSE load generator is built separately from the gateway:
+
+```bash
+cargo build --release --locked --example stress
+./target/release/examples/stress streams 1000 "$GATEWAY_IP" 8 proxy 16 50 ./gateway-ca.pem
+./target/release/examples/stress streams 1000 unused 8 direct 16 50 ./bench-ca.pem
+```
+
+Set `GATEWAY_IP` to the benchmark gateway. This example requires the synthetic SSE fixture
+at `bench.internal:443`, its registered client identity, and the corresponding CA files;
+it is not a load generator for arbitrary upstream services. The arguments after `streams`
+are connection count, gateway address, an unused body-size argument retained for compatibility
+with the Python fixture client, route, concurrent connection setups, arrival rate per second,
+and an optional CA file. Zero setup limit removes the setup concurrency bound; zero arrival
+rate disables pacing.
+`BENCH_DIRECT_ADDR` can override the direct fixture address; TLS still verifies `bench.internal`.
+
+Each worker must receive exactly 30 validated data events; fixture waiting heartbeats are
+accepted while its stream group forms. Every requested stream must overlap for at least five
+seconds. JSON output reports completion, overlap, timing and errors; any failed worker or
+insufficient overlap exits nonzero. Network operations have a ten-second deadline and workers
+a hundred-second deadline. Compare direct and proxied runs with the same fixture resources
+before drawing conclusions about gateway capacity. The example belongs only in benchmark
+images, never the production gateway image.
 
 Every push to `main` builds and pushes `latest` and the commit's short sha; briq runs a sha tag,
 pinned in its API, so a merge here reaches briq only with that pin's change. MIT licensed. The
