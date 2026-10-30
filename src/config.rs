@@ -216,6 +216,24 @@ struct State {
     own: HashMap<String, Vec<Secret>>,
 }
 
+impl State {
+    fn selected<'a>(
+        &'a self,
+        host: &'a str,
+        briq: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a Secret> + 'a {
+        let named = briq.and_then(|id| self.named.get(id));
+        let own = briq
+            .filter(|_| named.is_some())
+            .and_then(|id| self.own.get(id));
+        self.secrets
+            .iter()
+            .filter(move |s| named.is_some_and(|names| names.contains(&s.name)))
+            .chain(own.into_iter().flatten())
+            .filter(move |s| s.hosts.iter().any(|p| host_matches(p, host)))
+    }
+}
+
 /// The live config.
 pub struct Config {
     api: Arc<Api>,
@@ -316,20 +334,32 @@ impl Config {
     /// env, and its own, for that host. Naming a secret at run is the grant; a request from no
     /// known briq gets none, and another briq's placeholder passes through as text.
     pub fn for_host(&self, host: &str, briq: Option<&str>) -> Vec<Secret> {
-        let Some(briq) = briq else { return Vec::new() };
-        let state = self.state.read().unwrap().clone();
-        let Some(named) = state.named.get(briq) else {
-            return Vec::new();
-        };
-        let here = |s: &&Secret| s.hosts.iter().any(|p| host_matches(p, host));
-        state
-            .secrets
-            .iter()
-            .filter(|s| named.contains(&s.name))
-            .filter(here)
-            .chain(state.own.get(briq).into_iter().flatten().filter(here))
-            .cloned()
-            .collect()
+        self.for_host_with(host, briq, |_| Ok::<_, std::convert::Infallible>(()))
+            .unwrap()
+            .0
+    }
+
+    /// CONNECT needs only an existence check, never an unbudgeted copy of secret values.
+    pub fn has_for_host(&self, host: &str, briq: Option<&str>) -> bool {
+        self.state
+            .read()
+            .unwrap()
+            .selected(host, briq)
+            .next()
+            .is_some()
+    }
+
+    /// Admit a borrowed selection before copying any secret values. The same locked config
+    /// generation supplies the estimate and the owned values, including after a rotation.
+    pub fn for_host_with<T, E>(
+        &self,
+        host: &str,
+        briq: Option<&str>,
+        admit: impl FnOnce(&mut dyn Iterator<Item = &Secret>) -> Result<T, E>,
+    ) -> Result<(Vec<Secret>, T), E> {
+        let state = self.state.read().unwrap();
+        let permit = admit(&mut state.selected(host, briq))?;
+        Ok((state.selected(host, briq).cloned().collect(), permit))
     }
 
     /// Which briq an address belongs to, when the API told us about it.

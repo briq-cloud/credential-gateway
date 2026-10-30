@@ -8,6 +8,7 @@
 //!   GATEWAY_HELD_BODIES Maximum buffered request bodies (8; zero disables buffering)
 //!   GATEWAY_MAX_BODY_MB Maximum buffered bytes per body, in MiB (8)
 //!   GATEWAY_MAX_CONNECTIONS Maximum proxy sockets (1024; positive integer)
+//!   GATEWAY_REWRITE_BUDGET_MB Estimated matcher admission budget in MiB (64)
 //!   GATEWAY_LOG_LEVEL   debug, info (default), warn, error
 //!
 //! `credential-gateway health` asks a running gateway's /healthz: exit 0 when it answers.
@@ -57,7 +58,12 @@ fn body_options(get: impl Fn(&str) -> Option<String>) -> Result<Options, String>
         .checked_mul(1024 * 1024)
         .filter(|n| *n > 0 && *n <= isize::MAX as usize)
         .ok_or("GATEWAY_MAX_BODY_MB must be positive and fit in the address space")?;
+    let rewrite_budget = read("GATEWAY_REWRITE_BUDGET_MB", 64)?
+        .checked_mul(1024 * 1024)
+        .filter(|&n| n > 0 && n <= isize::MAX as usize)
+        .ok_or("GATEWAY_REWRITE_BUDGET_MB must be positive and fit in the address space")?;
     Ok(Options {
+        rewrite_budget,
         held_bodies,
         max_body,
         max_connections,
@@ -195,6 +201,7 @@ mod tests {
     fn body_limits_from_configuration() {
         let defaults = body_options(|_| None).unwrap();
         assert_eq!(defaults.max_connections, 1024);
+        assert_eq!(defaults.rewrite_budget, 64 * 1024 * 1024);
         assert_eq!(
             (defaults.held_bodies, defaults.max_body),
             (8, 8 * 1024 * 1024)
@@ -228,6 +235,7 @@ mod tests {
             "GATEWAY_HELD_BODIES",
             "GATEWAY_MAX_BODY_MB",
             "GATEWAY_MAX_CONNECTIONS",
+            "GATEWAY_REWRITE_BUDGET_MB",
         ] {
             for value in ["-1", "1.5", "bad", "184467440737095516160"] {
                 assert!(body_options(|key| (key == name).then(|| value.into())).is_err());
@@ -250,6 +258,21 @@ mod tests {
         assert!(
             body_options(|name| (name == "GATEWAY_HELD_BODIES").then(|| too_many.clone())).is_err()
         );
+    }
+    #[test]
+    fn rewrite_budget_is_positive_and_checked() {
+        assert_eq!(
+            body_options(|name| (name == "GATEWAY_REWRITE_BUDGET_MB").then(|| "16".into()))
+                .unwrap()
+                .rewrite_budget,
+            16 * 1024 * 1024
+        );
+        for value in ["0".to_owned(), usize::MAX.to_string()] {
+            assert!(
+                body_options(|name| (name == "GATEWAY_REWRITE_BUDGET_MB").then(|| value.clone()))
+                    .is_err()
+            );
+        }
     }
     #[test]
     fn config_response_byte_limit_is_validated() {

@@ -403,6 +403,40 @@ async fn world_admission(
     max_connections: usize,
     listen_address: &str,
 ) -> World {
+    world_resources(
+        state,
+        held_bodies,
+        max_body,
+        handshake_timeout,
+        max_connections,
+        listen_address,
+        credential_gateway::budget::DEFAULT_REWRITE_BUDGET,
+    )
+    .await
+}
+
+async fn world_budget(rewrite_budget: usize) -> World {
+    world_resources(
+        None,
+        2,
+        1024,
+        Duration::from_secs(10),
+        128,
+        "127.0.0.1",
+        rewrite_budget,
+    )
+    .await
+}
+
+async fn world_resources(
+    state: Option<&Path>,
+    held_bodies: usize,
+    max_body: usize,
+    handshake_timeout: Duration,
+    max_connections: usize,
+    listen_address: &str,
+    rewrite_budget: usize,
+) -> World {
     credential_gateway::log::set_level("off");
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tempfile::tempdir().unwrap();
@@ -432,6 +466,7 @@ async fn world_admission(
             held_bodies,
             handshake_timeout,
             max_connections,
+            rewrite_budget,
             upstream_ca: vec![dest.ca_der.clone()],
             upstream_port: Some(dest.port),
         },
@@ -1901,4 +1936,135 @@ async fn oversized_api_responses_preserve_the_last_good_config() {
             SECRET
         );
     }
+}
+
+fn many_credentials(count: usize, value_bytes: usize) -> Value {
+    let secrets: Vec<_> = (0..count)
+        .map(|i| {
+            json!({
+                "name": format!("KEY_{i}"), "placeholder": format!("briq_secret_{i:016x}"),
+                "value": format!("{i:08}") + &"x".repeat(value_bytes - 8),
+                "hosts": ["localhost"], "locations": ["header"]
+            })
+        })
+        .collect();
+    let names: Vec<_> = (0..count).map(|i| format!("KEY_{i}")).collect();
+    json!({"secrets":secrets,"briqs":[{"id":"bq_test","host":"localhost","secrets":names}]})
+}
+
+async fn budget_status(w: &World) -> String {
+    w.curl(&[
+        "--max-time",
+        "3",
+        "--cacert",
+        w.cacert(),
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "-H",
+        "Authorization: briq_secret_0000000000000000",
+        "https://localhost:443/echo",
+    ])
+    .await
+}
+
+#[tokio::test]
+async fn a_large_valid_config_is_refused_before_upstream_then_rotation_can_fit() {
+    let w = world_budget(1024 * 1024).await;
+    *w.api.config.lock().unwrap() = many_credentials(50, 4096);
+    w.config.refresh().await.unwrap();
+    assert_eq!(budget_status(&w).await, "503");
+    assert!(
+        w.received().is_empty(),
+        "refusal must precede any upstream disclosure"
+    );
+    assert_eq!(w.dest.sockets.accepted.load(Ordering::SeqCst), 0);
+    assert!(w.config.has_for_host("localhost", Some("bq_test")));
+    let borrowed = w
+        .config
+        .for_host_with("localhost", Some("bq_test"), |secrets| {
+            assert_eq!(secrets.count(), 50);
+            Err::<(), _>("no owned selection")
+        });
+    assert!(matches!(borrowed, Err("no owned selection")));
+    // The next request estimates the new generation, rather than retaining a stale decision.
+    *w.api.config.lock().unwrap() = many_credentials(1, 64);
+    w.config.refresh().await.unwrap();
+    assert_eq!(budget_status(&w).await, "200");
+    assert_eq!(
+        w.received()[0].headers["authorization"],
+        format!("00000000{}", "x".repeat(56))
+    );
+}
+
+#[tokio::test]
+async fn weighted_stream_admission_keeps_health_and_recovers_after_cancellation() {
+    // One 10×1KiB selection fits in2MiB; two do not. A tiny selection fits alongside it.
+    let w = world_budget(2 * 1024 * 1024).await;
+    *w.api.config.lock().unwrap() = many_credentials(10, 1024);
+    w.config.refresh().await.unwrap();
+    let proxy = format!("http://127.0.0.1:{}", w.proxy);
+    let mut child = Command::new("curl")
+        .args([
+            "-sS",
+            "-N",
+            "--max-time",
+            "4",
+            "-x",
+            &proxy,
+            "--cacert",
+            w.cacert(),
+            "https://localhost:443/stream",
+        ])
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(line, "data: one\n");
+    assert_eq!(budget_status(&w).await, "503");
+    assert_eq!(w.received().len(), 1);
+    let health = w
+        .curl(&[
+            "--max-time",
+            "2",
+            &format!("http://localhost:{}/healthz", w.proxy),
+        ])
+        .await;
+    assert!(health.contains("ok"), "{health}");
+    *w.api.config.lock().unwrap() = many_credentials(1, 64);
+    w.config.refresh().await.unwrap();
+    assert_eq!(
+        budget_status(&w).await,
+        "200",
+        "admission is weighted, not just a request count"
+    );
+    *w.api.config.lock().unwrap() = many_credentials(10, 1024);
+    w.config.refresh().await.unwrap();
+    assert_eq!(
+        budget_status(&w).await,
+        "503",
+        "the old stream retains its original reservation"
+    );
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if budget_status(&w).await == "200" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
 }

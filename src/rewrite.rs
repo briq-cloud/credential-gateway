@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, ready};
 
-use aho_corasick::{AhoCorasick, MatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
 use bytes::Bytes;
 use http_body::{Body, Frame};
 use pin_project_lite::pin_project;
@@ -31,6 +31,7 @@ impl Replacer {
         Self::with_builder(pairs, |pairs| {
             AhoCorasick::builder()
                 .match_kind(MatchKind::LeftmostLongest)
+                .kind(Some(AhoCorasickKind::ContiguousNFA))
                 .build(pairs.iter().map(|(f, _)| f.as_ref()))
                 .map_err(Into::into)
         })
@@ -339,6 +340,16 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn response_patterns_use_the_budgeted_nfa_representation() {
+        let pairs: Vec<_> = (0..50)
+            .map(|i| (format!("{i:04}{}", "x".repeat(4092)), "token"))
+            .collect();
+        let r = Replacer::new(&pairs).unwrap().unwrap();
+        assert_eq!(r.ac.kind(), AhoCorasickKind::ContiguousNFA);
+        assert!(r.ac.memory_usage() < 204800 * 128 + 50 * 4096 + 16384);
+    }
     use super::*;
 
     fn replacer() -> Arc<Replacer> {

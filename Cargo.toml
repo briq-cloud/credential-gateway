@@ -8,7 +8,7 @@ description = "briq's credential gateway: the proxy a team's briqs reach the int
 publish = false
 
 [dependencies]
-aho-corasick = "1.1"
+aho-corasick = "=1.1.5"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "deflate", "brotli", "zstd"] }
 bytes = "1"
 http = "1"

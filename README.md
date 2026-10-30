@@ -81,6 +81,7 @@ stops the gateway rather than being replaced: the team's briqs trust the one the
 | `GATEWAY_HELD_BODIES` | Maximum request bodies buffered at once: 8; 0 streams every body |
 | `GATEWAY_MAX_BODY_MB` | Buffer threshold for input and rewritten request bytes in MiB: 8; positive integer |
 | `GATEWAY_MAX_CONNECTIONS` | Maximum proxy sockets: 1024; positive integer |
+| `GATEWAY_REWRITE_BUDGET_MB` | Global estimated matcher construction/retention budget in MiB: 64; positive integer |
 | `GATEWAY_MAX_CONFIG_MB` | Maximum control-API response body in MiB: 8; positive integer |
 | `GATEWAY_LOG_LEVEL` | `debug`, `info` (default), `warn`, `error` |
 
@@ -94,6 +95,24 @@ sent chunked. Allow memory for TLS connections, rewriting and the runtime in add
 Invalid limits stop startup. The threshold applies to rewritten output as well as input;
 an expanding body that exceeds it streams chunked. Streaming rewriting emits at most
 64 KiB per output frame, including when one replacement is larger than that.
+
+Rewriting uses a contiguous NFA rather than the library's automatic DFA selection. Before
+copying a request's applicable secrets or building any matcher, the gateway reserves an
+estimate for all three directions (request headers, request body and response), plus owned
+secret metadata and pattern/replacement copies. For each nonempty matcher the estimate is
+128 bytes per pattern byte, 4096 bytes per rule and 16 KiB of fixed overhead. These
+conservative charges account for the pinned library's temporary NFA construction and were
+checked with distinct, overlapping, suffix and Unicode patterns; they are not a mathematical
+allocator bound or a process RSS limit. TLS, parsed global config, body buffers and other
+runtime memory need separate headroom.
+
+Requests that cannot reserve this budget receive 503 before reaching the upstream, including
+when one credential set alone exceeds it. There is no waiting queue and rewriting is never
+bypassed. Reservations follow both request and response bodies, including data pending socket
+writes, until their last owner releases them. Config rotations are estimated afresh on the
+next request. Large valid credential sets therefore reduce admitted concurrency or need a
+larger configured budget and VM. A small VM profile must specify this budget as well as its
+connection/body limits and be measured with representative credential sizes.
 
 The connection limit includes clients still sending headers, intercepted TLS connections and
 raw tunnels, until their sockets close. At capacity, additional remote sockets are closed.

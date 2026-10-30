@@ -41,9 +41,11 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::BoxError;
+use crate::budget::{Budget, DEFAULT_REWRITE_BUDGET, estimate};
 use crate::ca::Leafs;
 use crate::config::{Config, Secret};
 use crate::events::Events;
+use crate::retained::Retained;
 use crate::rewrite::{Replacer, Rewrite, Stream};
 
 pub type Body = UnsyncBoxBody<Bytes, BoxError>;
@@ -69,6 +71,8 @@ pub struct Options {
     pub held_bodies: usize,
     /// Maximum accepted proxy sockets, including headers, upgrades and tunnels.
     pub max_connections: usize,
+    /// Global estimated matcher construction/retention budget; excess requests get 503.
+    pub rewrite_budget: usize,
     /// Maximum time for a client to complete TLS after CONNECT.
     pub handshake_timeout: Duration,
     /// CAs trusted for destinations besides the public roots (tests).
@@ -83,6 +87,7 @@ impl Default for Options {
             max_body: 8 * 1024 * 1024,
             held_bodies: 8,
             max_connections: 1024,
+            rewrite_budget: DEFAULT_REWRITE_BUDGET,
             handshake_timeout: Duration::from_secs(10),
             upstream_ca: Vec::new(),
             upstream_port: None,
@@ -174,6 +179,7 @@ async fn reserved_health(stream: LimitedSocket) {
 pub struct Gateway {
     config: Arc<Config>,
     held: Arc<Semaphore>,
+    rewrite_budget: Arc<Budget>,
     connections: Arc<Semaphore>,
     health_connections: Arc<Semaphore>,
     leafs: Arc<Leafs>,
@@ -216,6 +222,7 @@ impl Gateway {
         Arc::new(Self {
             config,
             held: Arc::new(Semaphore::new(opts.held_bodies)),
+            rewrite_budget: Budget::new(opts.rewrite_budget),
             connections: Arc::new(Semaphore::new(opts.max_connections)),
             health_connections: Arc::new(Semaphore::new(HEALTH_CONNECTIONS)),
             leafs,
@@ -322,7 +329,7 @@ impl Gateway {
         }
         // Whether to intercept is decided here; which secrets apply is read again for each
         // request, so a revoked or rotated secret stops at the next one, kept-alive or not.
-        if port != 443 || self.config.for_host(&host, briq.as_deref()).is_empty() {
+        if port != 443 || !self.config.has_for_host(&host, briq.as_deref()) {
             return tunnel(req, &host, port).await;
         }
         let tls = match self.leafs.for_host(&host) {
@@ -395,7 +402,19 @@ impl Gateway {
         briq: Option<&str>,
         upstream: &Client<HttpsConnector<HttpConnector>, Body>,
     ) -> Result<Response<Body>, BoxError> {
-        let secrets = self.config.for_host(host, briq);
+        let (secrets, reservation) = match self.config.for_host_with(host, briq, |secrets| {
+            estimate(secrets)
+                .and_then(|bytes| self.rewrite_budget.reserve(bytes))
+                .ok_or(())
+        }) {
+            Ok(admitted) => admitted,
+            Err(()) => {
+                return Ok(text(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "credential gateway capacity exceeded\n",
+                ));
+            }
+        };
         // The request must address the CONNECT host: a Host naming another site on the same
         // address (a shared CDN) would carry the real value there. An absolute-form target is
         // refused too.
@@ -440,14 +459,14 @@ impl Gateway {
         // rewritten as it streams past that. Without such a secret it goes on untouched.
         let in_body: Vec<&Secret> = secrets.iter().filter(|s| s.allows("body")).collect();
         let mut body_hits = None;
-        let mut _held = None;
+        let mut held = None;
         let body: Body = match replacer(&in_body, |s| (&s.placeholder, &s.value))? {
             None => boxed(body),
             Some(r) => {
                 let r = Arc::new(r);
                 let (head, rest) = match self.held.clone().try_acquire_owned() {
                     Ok(permit) => {
-                        _held = Some(permit);
+                        held = Some(Arc::new(permit));
                         read_up_to(body, self.opts.max_body).await?
                     }
                     // As many bodies held as allowed: this one streams from its first byte.
@@ -501,10 +520,9 @@ impl Gateway {
                 "https://{}:{port}{path}",
                 bracketed(host)
             ))?)
-            .body(body)?;
+            .body(Retained::new(body, (reservation.clone(), held)).boxed_unsync())?;
         *up.headers_mut() = headers;
         let res = upstream.request(up).await;
-        drop(_held);
         if let Some(h) = &body_hits {
             used.extend(
                 in_body
@@ -590,7 +608,8 @@ impl Gateway {
             },
         };
         *out.headers_mut() = headers;
-        *out.body_mut() = Rewrite::new(body, Stream::new(scrub)).boxed_unsync();
+        *out.body_mut() =
+            Retained::new(Rewrite::new(body, Stream::new(scrub)), reservation).boxed_unsync();
         Ok(out)
     }
 
