@@ -423,7 +423,7 @@ impl Gateway {
         let mut used: Vec<String> = Vec::new();
         // Headers: every secret that allows them.
         let in_headers: Vec<&Secret> = secrets.iter().filter(|s| s.allows("header")).collect();
-        if let Some(r) = replacer(&in_headers, |s| (&s.placeholder, &s.value)) {
+        if let Some(r) = replacer(&in_headers, |s| (&s.placeholder, &s.value))? {
             let hits = match rewrite_headers(&mut headers, &r) {
                 Ok(hits) => hits,
                 Err(_) => {
@@ -441,7 +441,7 @@ impl Gateway {
         let in_body: Vec<&Secret> = secrets.iter().filter(|s| s.allows("body")).collect();
         let mut body_hits = None;
         let mut _held = None;
-        let body: Body = match replacer(&in_body, |s| (&s.placeholder, &s.value)) {
+        let body: Body = match replacer(&in_body, |s| (&s.placeholder, &s.value))? {
             None => boxed(body),
             Some(r) => {
                 let r = Arc::new(r);
@@ -524,7 +524,8 @@ impl Gateway {
         // again, in headers and body. Every secret that applies to this request, used or not.
         let Some(scrub) = replacer(&secrets.iter().collect::<Vec<_>>(), |s| {
             (&s.value, &s.placeholder)
-        }) else {
+        })?
+        else {
             // No secret applies any more (revoked since the connection opened): nothing to
             // scrub, the response goes on as it came.
             let (p, b) = res.into_parts();
@@ -718,7 +719,7 @@ async fn decoded(body: Incoming, encoding: &str) -> Option<Body> {
 fn replacer<'a>(
     secrets: &[&'a Secret],
     pick: impl Fn(&'a Secret) -> (&'a String, &'a String),
-) -> Option<Replacer> {
+) -> Result<Option<Replacer>, BoxError> {
     let pairs: Vec<(&String, &String)> = secrets.iter().map(|s| pick(s)).collect();
     Replacer::new(&pairs)
 }

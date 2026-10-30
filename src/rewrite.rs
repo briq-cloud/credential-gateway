@@ -25,20 +25,31 @@ pub struct Replacer {
 }
 
 impl Replacer {
-    /// `None` when there is nothing to look for (empty strings are left out).
-    pub fn new<F: AsRef<[u8]>, T: AsRef<[u8]>>(pairs: &[(F, T)]) -> Option<Self> {
+    /// `Ok(None)` only when there is nothing to look for (empty strings are left out).
+    /// A matcher construction failure is an error: callers must not bypass secret rewriting.
+    pub fn new<F: AsRef<[u8]>, T: AsRef<[u8]>>(pairs: &[(F, T)]) -> Result<Option<Self>, BoxError> {
+        Self::with_builder(pairs, |pairs| {
+            AhoCorasick::builder()
+                .match_kind(MatchKind::LeftmostLongest)
+                .build(pairs.iter().map(|(f, _)| f.as_ref()))
+                .map_err(Into::into)
+        })
+    }
+
+    // Keep error propagation testable without allocating billions of automaton states.
+    fn with_builder<F: AsRef<[u8]>, T: AsRef<[u8]>>(
+        pairs: &[(F, T)],
+        build: impl FnOnce(&[&(F, T)]) -> Result<AhoCorasick, BoxError>,
+    ) -> Result<Option<Self>, BoxError> {
         let pairs: Vec<_> = pairs
             .iter()
             .filter(|(f, _)| !f.as_ref().is_empty())
             .collect();
         if pairs.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let ac = AhoCorasick::builder()
-            .match_kind(MatchKind::LeftmostLongest)
-            .build(pairs.iter().map(|(f, _)| f.as_ref()))
-            .ok()?;
-        Some(Self {
+        let ac = build(&pairs)?;
+        Ok(Some(Self {
             ac,
             from: pairs.iter().map(|(f, _)| f.as_ref().to_vec()).collect(),
             to: pairs.iter().map(|(_, t)| t.as_ref().to_vec()).collect(),
@@ -47,7 +58,7 @@ impl Replacer {
                 .map(|(f, _)| f.as_ref().len())
                 .max()
                 .unwrap_or(1),
-        })
+        }))
     }
 
     pub fn patterns(&self) -> usize {
@@ -337,8 +348,25 @@ mod tests {
                 ("short", "S"),
                 ("real-secret-VALUE-longer", "briq_secret_bbbb"),
             ])
+            .unwrap()
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn matcher_failure_is_not_the_absence_of_secrets() {
+        let result = Replacer::with_builder(&[("real-secret", "placeholder")], |_| {
+            Err("injected matcher construction failure".into())
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("matcher failure would disable response scrubbing"),
+        };
+        assert_eq!(error.to_string(), "injected matcher construction failure");
+        let empty = Replacer::with_builder(&[("", "ignored")], |_| {
+            panic!("no matcher is needed for empty patterns")
+        });
+        assert!(empty.unwrap().is_none());
     }
 
     #[test]
@@ -406,7 +434,11 @@ mod tests {
     async fn one_large_replacement_is_emitted_in_bounded_frames() {
         use http_body_util::{BodyExt, Full};
         let value = "x".repeat(128 * 1024);
-        let replacer = Arc::new(Replacer::new(&[("a", value.as_str()), ("ab", "z")]).unwrap());
+        let replacer = Arc::new(
+            Replacer::new(&[("a", value.as_str()), ("ab", "z")])
+                .unwrap()
+                .unwrap(),
+        );
         let mut body = Rewrite::new(Full::new(Bytes::from_static(b"aa")), Stream::new(replacer));
         let mut total = 0;
         let mut frames = 0;
@@ -426,10 +458,10 @@ mod tests {
 
     #[test]
     fn rewritten_size_is_checked_before_allocation() {
-        let r = Replacer::new(&[("a", "expanded")]).unwrap();
+        let r = Replacer::new(&[("a", "expanded")]).unwrap().unwrap();
         assert_eq!(r.replaced_len(b"aa", 16), Some(16));
         assert_eq!(r.replaced_len(b"aa", 15), None);
-        let mixed = Replacer::new(&[("a", "XX"), ("b", "")]).unwrap();
+        let mixed = Replacer::new(&[("a", "XX"), ("b", "")]).unwrap().unwrap();
         assert_eq!(mixed.replaced_len(b"ab", 2), Some(2));
     }
 }
