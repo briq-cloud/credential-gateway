@@ -54,7 +54,7 @@ async fn new_briq(failures: usize, wait: Duration) -> (Arc<Config>, Arc<ApiState
     });
     (
         Arc::new(Config::new(
-            Arc::new(Api::new(&url, "gw-token")),
+            Arc::new(Api::new(&url, gateway_api_token())),
             resolve,
             wait,
         )),
@@ -90,7 +90,10 @@ async fn gives_up_on_an_unknown_address_after_its_wait() {
 #[tokio::test]
 async fn reads_a_response_whose_codings_come_in_two_headers() {
     let w = world().await;
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     // `identity` then `gzip`: read as gzip, scrubbed.
     let out = w
         .curl(&[
@@ -103,16 +106,25 @@ async fn reads_a_response_whose_codings_come_in_two_headers() {
         ])
         .await;
     assert!(
-        out.contains(&format!("\"auth\":\"Bearer {PLACEHOLDER}\"")),
+        out.contains(&format!(
+            "\"auth\":\"Bearer {token_placeholder}\"",
+            token_placeholder = placeholder()
+        )),
         "{out}"
     );
-    assert!(!out.contains(SECRET), "the real value reached the client");
+    assert!(
+        !out.contains(token_secret()),
+        "the real value reached the client"
+    );
 }
 
 #[tokio::test]
 async fn refuses_a_response_it_cannot_read() {
     let w = world().await;
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     let out = w
         .curl(&[
             "--cacert",
@@ -127,7 +139,10 @@ async fn refuses_a_response_it_cannot_read() {
         ])
         .await;
     assert!(out.ends_with("502"), "{out}");
-    assert!(!out.contains(SECRET), "the real value reached the client");
+    assert!(
+        !out.contains(token_secret()),
+        "the real value reached the client"
+    );
 }
 
 /// A request on a connection kept open from before a secret was revoked: the secret is not put
@@ -174,7 +189,13 @@ async fn reads_which_secrets_apply_for_each_request_on_a_kept_alive_connection()
         Request::builder()
             .uri("/kept")
             .header("host", "localhost")
-            .header("authorization", format!("Bearer {PLACEHOLDER}"))
+            .header(
+                "authorization",
+                format!(
+                    "Bearer {token_placeholder}",
+                    token_placeholder = placeholder()
+                ),
+            )
             .body(full(""))
             .unwrap()
     };
@@ -197,10 +218,16 @@ async fn reads_which_secrets_apply_for_each_request_on_a_kept_alive_connection()
         .unwrap();
     let got = w.received();
     assert_eq!(got.len(), 2);
-    assert_eq!(got[0].headers["authorization"], format!("Bearer {SECRET}"));
+    assert_eq!(
+        got[0].headers["authorization"],
+        format!("Bearer {token}", token = token_secret())
+    );
     assert_eq!(
         got[1].headers["authorization"],
-        format!("Bearer {PLACEHOLDER}")
+        format!(
+            "Bearer {token_placeholder}",
+            token_placeholder = placeholder()
+        )
     );
 }
 
@@ -227,7 +254,7 @@ async fn gives_no_secrets_to_an_address_two_briqs_claim() {
         })
     });
     let config = Config::new(
-        Arc::new(Api::new(&url, "gw-token")),
+        Arc::new(Api::new(&url, gateway_api_token())),
         resolve,
         Duration::from_millis(10),
     );
@@ -291,17 +318,17 @@ async fn body_limits_choose_buffering_or_streaming_without_losing_secrets() {
                 "--cacert",
                 w.cacert(),
                 "--data-binary",
-                BODY_PLACEHOLDER,
+                body_placeholder(),
                 "https://localhost:443/post",
             ])
             .await;
         let got = w.received();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].body, BODY_SECRET.as_bytes());
+        assert_eq!(got[0].body, body_secret().as_bytes());
         assert_eq!(got[0].headers.contains_key("transfer-encoding"), chunked);
         assert_eq!(got[0].headers.contains_key("content-length"), !chunked);
-        assert!(!out.contains(BODY_SECRET));
-        assert!(out.contains(BODY_PLACEHOLDER));
+        assert!(!out.contains(body_secret()));
+        assert!(out.contains(body_placeholder()));
     }
 }
 
@@ -310,7 +337,10 @@ async fn config_outage_and_malformed_config_preserve_last_good_then_recover() {
     let w = world().await;
     w.api.config_down.store(true, Ordering::SeqCst);
     assert!(w.config.refresh().await.is_err());
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     // Last-known secrets remain usable during a control-plane outage.
     let out = w
         .curl(&[
@@ -323,8 +353,8 @@ async fn config_outage_and_malformed_config_preserve_last_good_then_recover() {
             "https://localhost:443/echo",
         ])
         .await;
-    assert!(out.contains(PLACEHOLDER));
-    assert!(!out.contains(SECRET));
+    assert!(out.contains(placeholder()));
+    assert!(!out.contains(token_secret()));
     w.api.config_down.store(false, Ordering::SeqCst);
     *w.api.config.lock().unwrap() = json!({"secrets": "broken"});
     assert!(w.config.refresh().await.is_err());
@@ -339,8 +369,8 @@ async fn config_outage_and_malformed_config_preserve_last_good_then_recover() {
             "https://localhost:443/echo",
         ])
         .await;
-    assert!(out.contains(PLACEHOLDER));
-    assert!(!out.contains(SECRET));
+    assert!(out.contains(placeholder()));
+    assert!(!out.contains(token_secret()));
     *w.api.config.lock().unwrap() = team_config();
     w.api.config.lock().unwrap()["briqs"][0]["secrets"] = json!([]);
     w.config.refresh().await.unwrap();
@@ -356,11 +386,20 @@ async fn config_outage_and_malformed_config_preserve_last_good_then_recover() {
     .await;
     let got = w.received();
     assert_eq!(got.len(), 3);
-    assert_eq!(got[0].headers["authorization"], format!("Bearer {SECRET}"));
-    assert_eq!(got[1].headers["authorization"], format!("Bearer {SECRET}"));
+    assert_eq!(
+        got[0].headers["authorization"],
+        format!("Bearer {token}", token = token_secret())
+    );
+    assert_eq!(
+        got[1].headers["authorization"],
+        format!("Bearer {token}", token = token_secret())
+    );
     assert_eq!(
         got[2].headers["authorization"],
-        format!("Bearer {PLACEHOLDER}")
+        format!(
+            "Bearer {token_placeholder}",
+            token_placeholder = placeholder()
+        )
     );
 }
 
@@ -390,7 +429,10 @@ async fn connection_churn_and_aborted_tls_do_not_break_healthy_requests() {
         )
         .await
         .unwrap();
-        let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+        let auth = format!(
+            "Authorization: Bearer {token_placeholder}",
+            token_placeholder = placeholder()
+        );
         let out = w
             .curl(&[
                 "--max-time",
@@ -402,8 +444,8 @@ async fn connection_churn_and_aborted_tls_do_not_break_healthy_requests() {
                 "https://localhost:443/echo",
             ])
             .await;
-        assert!(out.contains(PLACEHOLDER), "{out}");
-        assert!(!out.contains(SECRET));
+        assert!(out.contains(placeholder()), "{out}");
+        assert!(!out.contains(token_secret()));
     }
     assert_eq!(w.received().len(), 4);
 }
@@ -411,7 +453,12 @@ async fn connection_churn_and_aborted_tls_do_not_break_healthy_requests() {
 #[tokio::test]
 async fn concurrent_body_pressure_keeps_substitution_and_scrubbing_correct() {
     let w = world_limits(None, 2, 1024).await;
-    let data = format!("{}{BODY_PLACEHOLDER}{}", "x".repeat(4096), "y".repeat(4096));
+    let data = format!(
+        "{}{body_marker}{}",
+        "x".repeat(4096),
+        "y".repeat(4096),
+        body_marker = body_placeholder()
+    );
     let file = w._dir.path().join("stress.txt");
     std::fs::write(&file, &data).unwrap();
     let at = format!("@{}", file.display());
@@ -427,8 +474,8 @@ async fn concurrent_body_pressure_keeps_substitution_and_scrubbing_correct() {
                 "https://localhost:443/echo",
             ])
             .await;
-        assert!(out.contains(BODY_PLACEHOLDER));
-        assert!(!out.contains(BODY_SECRET));
+        assert!(out.contains(body_placeholder()));
+        assert!(!out.contains(body_secret()));
     });
     tokio::time::timeout(
         Duration::from_secs(20),
@@ -441,7 +488,7 @@ async fn concurrent_body_pressure_keeps_substitution_and_scrubbing_correct() {
     for request in got {
         assert_eq!(
             request.body,
-            data.replace(BODY_PLACEHOLDER, BODY_SECRET).as_bytes()
+            data.replace(body_placeholder(), body_secret()).as_bytes()
         );
     }
 }
@@ -450,9 +497,12 @@ async fn concurrent_body_pressure_keeps_substitution_and_scrubbing_correct() {
 async fn an_upstream_reset_does_not_expose_a_partial_secret_or_poison_later_requests() {
     let w = world().await;
     let proxy = format!("http://127.0.0.1:{}", w.proxy);
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     use tokio::io::AsyncReadExt;
-    let mut child = Command::new("curl")
+    let mut child = fixture_curl()
         .args([
             "-sS",
             "-N",
@@ -490,9 +540,9 @@ async fn an_upstream_reset_does_not_expose_a_partial_secret_or_poison_later_requ
         "truncated upstream must fail"
     );
     let body = String::from_utf8_lossy(&tail);
-    assert!(!body.contains(SECRET));
+    assert!(!body.contains(token_secret()));
     assert!(
-        !body.contains(&SECRET[..10]),
+        !body.contains(&token_secret()[..10]),
         "a possible secret prefix must stay withheld: {body}"
     );
     let healthy = w
@@ -506,19 +556,22 @@ async fn an_upstream_reset_does_not_expose_a_partial_secret_or_poison_later_requ
             "https://localhost:443/echo",
         ])
         .await;
-    assert!(healthy.contains(PLACEHOLDER));
-    assert!(!healthy.contains(SECRET));
+    assert!(healthy.contains(placeholder()));
+    assert!(!healthy.contains(token_secret()));
 }
 
 #[tokio::test]
 async fn stalled_upstream_streams_allow_other_requests_and_recover_after_client_cancellation() {
     let w = world().await;
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     let proxy = format!("http://127.0.0.1:{}", w.proxy);
     let mut children = Vec::new();
     for _ in 0..16 {
         children.push(
-            Command::new("curl")
+            fixture_curl()
                 .args([
                     "-sS",
                     "-N",
@@ -563,12 +616,12 @@ async fn stalled_upstream_streams_allow_other_requests_and_recover_after_client_
             "https://localhost:443/echo",
         ])
         .await;
-    assert!(healthy.contains(PLACEHOLDER));
-    assert!(!healthy.contains(SECRET));
+    assert!(healthy.contains(placeholder()));
+    assert!(!healthy.contains(token_secret()));
     for child in children {
         let out = child.wait_with_output().await.unwrap();
         assert!(!out.status.success());
-        assert!(!String::from_utf8_lossy(&out.stdout).contains(SECRET));
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(token_secret()));
     }
     let healthy = w
         .curl(&[
@@ -581,7 +634,7 @@ async fn stalled_upstream_streams_allow_other_requests_and_recover_after_client_
             "https://localhost:443/echo",
         ])
         .await;
-    assert!(healthy.contains(PLACEHOLDER));
+    assert!(healthy.contains(placeholder()));
 }
 
 #[tokio::test]
@@ -606,7 +659,10 @@ async fn incomplete_tls_handshakes_expire_and_healthy_clients_still_work() {
         .await
         .unwrap()
         .unwrap();
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     let out = w
         .curl(&[
             "--max-time",
@@ -618,18 +674,18 @@ async fn incomplete_tls_handshakes_expire_and_healthy_clients_still_work() {
             "https://localhost:443/echo",
         ])
         .await;
-    assert!(out.contains(PLACEHOLDER));
-    assert!(!out.contains(SECRET));
+    assert!(out.contains(placeholder()));
+    assert!(!out.contains(token_secret()));
 }
 
 #[tokio::test]
 async fn amplified_bodies_stream_when_rewritten_output_exceeds_buffer_budget() {
     let w = world_limits(None, 2, 1024).await;
-    let long_value = "secret-expanded-".repeat(256);
+    let long_value = credentials::ascii(4096);
     w.api.config.lock().unwrap()["secrets"][1]["value"] = json!(long_value);
     w.config.refresh().await.unwrap();
     // The input fits in 1KiB, but the rewritten output does not.
-    let input = BODY_PLACEHOLDER.repeat(16);
+    let input = body_placeholder().repeat(16);
     assert!(input.len() < 1024);
     let out = w
         .curl(&[
@@ -650,6 +706,6 @@ async fn amplified_bodies_stream_when_rewritten_output_exceeds_buffer_budget() {
         "amplified output must not be buffered whole"
     );
     assert_eq!(got[0].headers["transfer-encoding"], "chunked");
-    assert!(out.contains(BODY_PLACEHOLDER));
+    assert!(out.contains(body_placeholder()));
     assert!(!out.contains(&long_value));
 }

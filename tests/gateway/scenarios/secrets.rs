@@ -7,7 +7,10 @@ async fn registers_its_ca_with_the_api() {
 #[tokio::test]
 async fn swaps_the_placeholder_for_the_real_value_in_a_header_and_back_in_the_response() {
     let w = world().await;
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     let out = w
         .curl(&[
             "--cacert",
@@ -21,25 +24,40 @@ async fn swaps_the_placeholder_for_the_real_value_in_a_header_and_back_in_the_re
         .await;
     let got = w.received();
     assert_eq!(got.len(), 1);
-    assert_eq!(got[0].headers["authorization"], format!("Bearer {SECRET}"));
+    assert_eq!(
+        got[0].headers["authorization"],
+        format!("Bearer {token}", token = token_secret())
+    );
     assert_eq!(got[0].uri, "/echo?x=1");
     assert_eq!(got[0].headers["accept-encoding"], "identity");
     // The client sees the placeholder, in the header and in the body the destination echoed.
     assert!(
-        out.contains(&format!("x-echo-auth: Bearer {PLACEHOLDER}")),
+        out.contains(&format!(
+            "x-echo-auth: Bearer {token_placeholder}",
+            token_placeholder = placeholder()
+        )),
         "{out}"
     );
     assert!(
-        out.contains(&format!("\"auth\":\"Bearer {PLACEHOLDER}\"")),
+        out.contains(&format!(
+            "\"auth\":\"Bearer {token_placeholder}\"",
+            token_placeholder = placeholder()
+        )),
         "{out}"
     );
-    assert!(!out.contains(SECRET), "the real value reached the client");
+    assert!(
+        !out.contains(token_secret()),
+        "the real value reached the client"
+    );
 }
 
 #[tokio::test]
 async fn puts_in_only_the_secrets_the_briq_named() {
     let w = world().await;
-    let auth = format!("Authorization: Bearer {OTHER_PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {other_marker}",
+        other_marker = other_placeholder()
+    );
     w.curl(&[
         "--cacert",
         w.cacert(),
@@ -52,14 +70,17 @@ async fn puts_in_only_the_secrets_the_briq_named() {
     assert_eq!(got.len(), 1);
     assert_eq!(
         got[0].headers["authorization"],
-        format!("Bearer {OTHER_PLACEHOLDER}")
+        format!("Bearer {other_marker}", other_marker = other_placeholder())
     );
 }
 
 #[tokio::test]
 async fn puts_in_the_briqs_own_secret_and_scrubs_it_from_the_response() {
     let w = world().await;
-    let auth = format!("Authorization: Bearer {OWN_PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {own_marker}",
+        own_marker = own_placeholder()
+    );
     let out = w
         .curl(&[
             "--cacert",
@@ -73,14 +94,17 @@ async fn puts_in_the_briqs_own_secret_and_scrubs_it_from_the_response() {
         .await;
     assert_eq!(
         w.received()[0].headers["authorization"],
-        format!("Bearer {OWN_SECRET}")
+        format!("Bearer {own_value}", own_value = own_secret())
     );
     assert!(
-        out.contains(&format!("x-echo-auth: Bearer {OWN_PLACEHOLDER}")),
+        out.contains(&format!(
+            "x-echo-auth: Bearer {own_marker}",
+            own_marker = own_placeholder()
+        )),
         "{out}"
     );
     assert!(
-        !out.contains(OWN_SECRET),
+        !out.contains(own_secret()),
         "the real value reached the client"
     );
 }
@@ -88,7 +112,7 @@ async fn puts_in_the_briqs_own_secret_and_scrubs_it_from_the_response() {
 #[tokio::test]
 async fn substitutes_in_the_body_only_for_a_secret_that_allows_it() {
     let w = world().await;
-    let data = json!({ "a": PLACEHOLDER, "b": BODY_PLACEHOLDER }).to_string();
+    let data = json!({ "a": placeholder(), "b": body_placeholder() }).to_string();
     w.curl(&[
         "--cacert",
         w.cacert(),
@@ -105,10 +129,11 @@ async fn substitutes_in_the_body_only_for_a_secret_that_allows_it() {
     assert_eq!(got.len(), 1);
     let body: Value = serde_json::from_slice(&got[0].body).unwrap();
     assert_eq!(
-        body["a"], PLACEHOLDER,
+        body["a"],
+        placeholder(),
         "a header-only secret is never put in a body"
     );
-    assert_eq!(body["b"], BODY_SECRET);
+    assert_eq!(body["b"], body_secret());
     assert_eq!(
         got[0].headers["content-length"],
         got[0].body.len().to_string()
@@ -134,9 +159,10 @@ async fn substitutes_in_a_body_larger_than_it_holds_as_it_streams() {
     let w = world().await;
     // Over the 1 KiB the test gateway holds, the placeholder past it and at a chunk's edge.
     let data = format!(
-        "{}{BODY_PLACEHOLDER}{}{BODY_PLACEHOLDER}",
+        "{}{body_marker}{}{body_marker}",
         "x".repeat(1500),
-        "y".repeat(70_000)
+        "y".repeat(70_000),
+        body_marker = body_placeholder()
     );
     let file = w._dir.path().join("big.txt");
     std::fs::write(&file, &data).unwrap();
@@ -153,14 +179,17 @@ async fn substitutes_in_a_body_larger_than_it_holds_as_it_streams() {
     .await;
     let got = w.received();
     assert_eq!(got.len(), 1);
-    let want = data.replace(BODY_PLACEHOLDER, BODY_SECRET);
+    let want = data.replace(body_placeholder(), body_secret());
     assert_eq!(String::from_utf8_lossy(&got[0].body), want);
 }
 
 #[tokio::test]
 async fn reads_a_response_that_comes_compressed_anyway() {
     let w = world().await;
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     let out = w
         .curl(&[
             "--cacert",
@@ -177,11 +206,14 @@ async fn reads_a_response_that_comes_compressed_anyway() {
         .await;
     // Decompressed, scrubbed, sent on plain.
     assert!(
-        out.contains(&format!("\"auth\":\"Bearer {PLACEHOLDER}\"")),
+        out.contains(&format!(
+            "\"auth\":\"Bearer {token_placeholder}\"",
+            token_placeholder = placeholder()
+        )),
         "{out}"
     );
     assert!(
-        !out.contains(SECRET),
+        !out.contains(token_secret()),
         "the real value reached the client in a compressed body"
     );
     assert!(
@@ -194,8 +226,11 @@ async fn reads_a_response_that_comes_compressed_anyway() {
 async fn passes_a_streamed_response_on_as_it_comes() {
     let w = world().await;
     let proxy = format!("http://127.0.0.1:{}", w.proxy);
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
-    let mut child = Command::new("curl")
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
+    let mut child = fixture_curl()
         .args([
             "-sSN",
             "-x",
@@ -231,7 +266,10 @@ async fn passes_a_streamed_response_on_as_it_comes() {
 #[tokio::test]
 async fn scrubs_a_real_value_split_across_two_writes() {
     let w = world().await;
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     let out = w
         .curl(&[
             "--cacert",
@@ -241,13 +279,22 @@ async fn scrubs_a_real_value_split_across_two_writes() {
             "https://localhost:443/split",
         ])
         .await;
-    assert_eq!(out, format!("before {PLACEHOLDER} after"));
+    assert_eq!(
+        out,
+        format!(
+            "before {token_placeholder} after",
+            token_placeholder = placeholder()
+        )
+    );
 }
 
 #[tokio::test]
 async fn refuses_a_request_whose_host_is_not_the_connect_host() {
     let w = world().await;
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     let out = w
         .curl(&[
             "--cacert",
@@ -270,7 +317,10 @@ async fn refuses_a_request_whose_host_is_not_the_connect_host() {
 #[tokio::test]
 async fn tunnels_a_host_no_secret_allows_without_touching_the_bytes() {
     let w = world().await;
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     let url = format!("https://localhost:{}/tunnel", w.dest.port);
     // The destination's own CA, since the gateway did not terminate anything.
     let out = w
@@ -286,16 +336,19 @@ async fn tunnels_a_host_no_secret_allows_without_touching_the_bytes() {
     assert_eq!(got.len(), 1);
     assert_eq!(
         got[0].headers["authorization"],
-        format!("Bearer {PLACEHOLDER}"),
+        format!(
+            "Bearer {token_placeholder}",
+            token_placeholder = placeholder()
+        ),
         "no injection off the allow-list"
     );
-    assert!(out.contains(PLACEHOLDER));
+    assert!(out.contains(placeholder()));
 }
 
 #[tokio::test]
 async fn answers_its_health_check() {
     let w = world().await;
-    let out = Command::new("curl")
+    let out = fixture_curl()
         .args(["-sS", &format!("http://127.0.0.1:{}/healthz", w.proxy)])
         .output()
         .await
@@ -306,7 +359,10 @@ async fn answers_its_health_check() {
 #[tokio::test]
 async fn reports_which_briq_used_which_secret_against_which_host() {
     let w = world().await;
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     w.curl(&[
         "--cacert",
         w.cacert(),
@@ -374,7 +430,10 @@ async fn uses_the_ca_an_earlier_gateway_left_on_the_volume() {
         registered,
         std::fs::read_to_string(fixture.join("ca.crt")).unwrap()
     );
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     let fixture_ca = fixture.join("ca.crt");
     let out = w
         .curl(&[
@@ -395,6 +454,6 @@ async fn uses_the_ca_an_earlier_gateway_left_on_the_volume() {
     );
     assert_eq!(
         w.received()[0].headers["authorization"],
-        format!("Bearer {SECRET}")
+        format!("Bearer {token}", token = token_secret())
     );
 }

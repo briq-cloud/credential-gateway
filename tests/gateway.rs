@@ -1,6 +1,9 @@
 //! The gateway against a fake API and a fake destination, with curl as the client, as a briq's
 //! tools would be: the destination gets the real value, the client never does.
 
+#[path = "support/credentials.rs"]
+mod credentials;
+
 include!("gateway/shared.rs");
 
 include!("gateway/scenarios/secrets.rs");

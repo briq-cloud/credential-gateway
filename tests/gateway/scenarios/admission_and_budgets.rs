@@ -137,8 +137,11 @@ async fn admission_reserve_is_bounded_and_partial_health_requests_expire() {
 async fn admission_holds_permit_through_intercepted_tls_stream() {
     let w = world_admission(None, 2, 1024, Duration::from_secs(10), 1, "127.0.0.1").await;
     let proxy = format!("http://127.0.0.1:{}", w.proxy);
-    let auth = format!("Authorization: Bearer {PLACEHOLDER}");
-    let mut child = Command::new("curl")
+    let auth = format!(
+        "Authorization: Bearer {token_placeholder}",
+        token_placeholder = placeholder()
+    );
+    let mut child = fixture_curl()
         .args([
             "-sS",
             "-N",
@@ -204,9 +207,9 @@ async fn admission_health_reserve_accepts_ipv4_mapped_loopback() {
 #[tokio::test]
 async fn amplified_request_headers_are_rejected_before_sending_secrets() {
     let w = world().await;
-    w.api.config.lock().unwrap()["secrets"][0]["value"] = json!("x".repeat(4096));
+    w.api.config.lock().unwrap()["secrets"][0]["value"] = json!(credentials::ascii(4096));
     w.config.refresh().await.unwrap();
-    let header = format!("Authorization: {}", PLACEHOLDER.repeat(32));
+    let header = format!("Authorization: {}", placeholder().repeat(32));
     let out = w
         .curl(&[
             "--max-time",
@@ -227,9 +230,12 @@ async fn amplified_request_headers_are_rejected_before_sending_secrets() {
 #[tokio::test]
 async fn amplified_response_headers_fail_closed() {
     let w = world().await;
-    w.api.config.lock().unwrap()["secrets"][0]["value"] = json!("A");
+    w.api.config.lock().unwrap()["secrets"][0]["value"] = json!(&token_secret()[..1]);
     w.config.refresh().await.unwrap();
-    let auth = format!("Authorization: {PLACEHOLDER}");
+    let auth = format!(
+        "Authorization: {token_placeholder}",
+        token_placeholder = placeholder()
+    );
     let out = w
         .curl(&[
             "--max-time",
@@ -249,10 +255,10 @@ async fn amplified_response_headers_fail_closed() {
 #[tokio::test]
 async fn rewritten_headers_share_one_aggregate_budget() {
     let w = world().await;
-    w.api.config.lock().unwrap()["secrets"][0]["value"] = json!("x".repeat(4096));
+    w.api.config.lock().unwrap()["secrets"][0]["value"] = json!(credentials::ascii(4096));
     w.config.refresh().await.unwrap();
-    let one = format!("X-One: {}", PLACEHOLDER.repeat(10));
-    let two = format!("X-Two: {}", PLACEHOLDER.repeat(10));
+    let one = format!("X-One: {}", placeholder().repeat(10));
+    let two = format!("X-Two: {}", placeholder().repeat(10));
     let out = w
         .curl(&[
             "--max-time",
@@ -315,7 +321,13 @@ async fn upstream_keepalive_is_scoped_to_the_connect_session() {
         Request::builder()
             .uri("/kept")
             .header("host", "localhost")
-            .header("authorization", format!("Bearer {PLACEHOLDER}"))
+            .header(
+                "authorization",
+                format!(
+                    "Bearer {token_placeholder}",
+                    token_placeholder = placeholder()
+                ),
+            )
             .body(full(""))
             .unwrap()
     };
@@ -356,25 +368,31 @@ async fn oversized_api_responses_preserve_the_last_good_config() {
     for chunked in [false, true] {
         let (url, state) = fake_api(team_config()).await;
         state.config_chunked.store(chunked, Ordering::SeqCst);
-        let api = Arc::new(Api::new(&url, "gw-token").with_response_limit(2048));
+        let api = Arc::new(Api::new(&url, gateway_api_token()).with_response_limit(2048));
         let config = Config::new(api, local(), Duration::from_secs(1));
         config.refresh().await.unwrap();
-        state.config.lock().unwrap()["secrets"][0]["value"] = json!("x".repeat(4096));
+        state.config.lock().unwrap()["secrets"][0]["value"] = json!(credentials::ascii(4096));
         assert!(config.refresh().await.is_err());
         let secrets = config.for_host("localhost", Some("bq_test"));
         assert_eq!(
             secrets.iter().find(|s| s.name == "TOKEN").unwrap().value,
-            SECRET
+            token_secret()
         );
     }
+}
+
+fn budget_placeholder(index: usize) -> String {
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let seed = SEED.get_or_init(|| u64::from_str_radix(&credentials::ascii(16), 16).unwrap());
+    format!("briq_secret_{:016x}", seed ^ u64::try_from(index).unwrap())
 }
 
 fn many_credentials(count: usize, value_bytes: usize) -> Value {
     let secrets: Vec<_> = (0..count)
         .map(|i| {
             json!({
-                "name": format!("KEY_{i}"), "placeholder": format!("briq_secret_{i:016x}"),
-                "value": format!("{i:08}") + &"x".repeat(value_bytes - 8),
+                "name": format!("KEY_{i}"), "placeholder": budget_placeholder(i),
+                "value": credentials::ascii(value_bytes),
                 "hosts": ["localhost"], "locations": ["header"]
             })
         })
@@ -384,6 +402,7 @@ fn many_credentials(count: usize, value_bytes: usize) -> Value {
 }
 
 async fn budget_status(w: &World) -> String {
+    let authorization = format!("Authorization: {}", budget_placeholder(0));
     w.curl(&[
         "--max-time",
         "3",
@@ -394,7 +413,7 @@ async fn budget_status(w: &World) -> String {
         "-w",
         "%{http_code}",
         "-H",
-        "Authorization: briq_secret_0000000000000000",
+        &authorization,
         "https://localhost:443/echo",
     ])
     .await
@@ -420,13 +439,12 @@ async fn a_large_valid_config_is_refused_before_upstream_then_rotation_can_fit()
         });
     assert!(matches!(borrowed, Err("no owned selection")));
     // The next request estimates the new generation, rather than retaining a stale decision.
-    *w.api.config.lock().unwrap() = many_credentials(1, 64);
+    let rotated = many_credentials(1, 64);
+    let expected = rotated["secrets"][0]["value"].as_str().unwrap().to_owned();
+    *w.api.config.lock().unwrap() = rotated;
     w.config.refresh().await.unwrap();
     assert_eq!(budget_status(&w).await, "200");
-    assert_eq!(
-        w.received()[0].headers["authorization"],
-        format!("00000000{}", "x".repeat(56))
-    );
+    assert_eq!(w.received()[0].headers["authorization"], expected);
 }
 
 #[tokio::test]
@@ -436,7 +454,7 @@ async fn weighted_stream_admission_keeps_health_and_recovers_after_cancellation(
     *w.api.config.lock().unwrap() = many_credentials(10, 1024);
     w.config.refresh().await.unwrap();
     let proxy = format!("http://127.0.0.1:{}", w.proxy);
-    let mut child = Command::new("curl")
+    let mut child = fixture_curl()
         .args([
             "-sS",
             "-N",

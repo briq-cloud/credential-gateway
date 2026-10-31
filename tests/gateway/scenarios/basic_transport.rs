@@ -186,7 +186,9 @@ async fn basic_transport_aliases_headers_streams_codings_and_trailers() {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
     for username in ["a", "ab", "abc"] {
         let w = world().await;
-        let password = "p:é~??/tail";
+        let generated_password = credentials::structured();
+        let password = generated_password.as_str();
+        assert_eq!(password.len() % 3, 0);
         w.api.config.lock().unwrap()["secrets"][0]["value"] = json!(password);
         w.config.refresh().await.unwrap();
         let real_pair = format!("{username}:{password}");
@@ -196,7 +198,7 @@ async fn basic_transport_aliases_headers_streams_codings_and_trailers() {
             .collect();
         let mut session = basic_session(&w).await;
         for coding in ["identity", "gzip", "deflate"] {
-            let auth = format!("Basic {}", basic_fixture(username, PLACEHOLDER));
+            let auth = format!("Basic {}", basic_fixture(username, placeholder()));
             let mut request = basic_request("/basic-variants", &auth);
             request.headers_mut().insert(
                 "x-fixture-coding",
@@ -210,7 +212,7 @@ async fn basic_transport_aliases_headers_streams_codings_and_trailers() {
             for alias in &aliases {
                 assert!(!output.contains(alias), "encoded credential reached client");
             }
-            assert!(String::from_utf8_lossy(&body).contains(PLACEHOLDER));
+            assert!(String::from_utf8_lossy(&body).contains(placeholder()));
         }
         assert!(
             w.received()
@@ -225,34 +227,55 @@ async fn basic_transport_aliases_headers_streams_codings_and_trailers() {
 async fn basic_transport_refuses_shapes_framing_duplicates_and_bad_values_before_forwarding() {
     let w = world().await;
     let mut session = basic_session(&w).await;
+    let ordinary = basic_fixture("u", &credentials::ascii(6));
+    let alternate = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE,
+        format!("u:{}?", credentials::ascii(6)),
+    );
     for auth in [
         "Basic".to_string(),
-        "Basic dTpw=".into(),
-        "Basic dTo_".into(),
-        "Basic dTpw, Bearer x".into(),
-        format!("Basic {}", basic_fixture(PLACEHOLDER, "public")),
+        format!("Basic {ordinary}="),
+        format!("Basic {alternate}"),
+        format!("Basic {ordinary}, Bearer {}", credentials::ascii(8)),
         format!(
             "Basic {}",
-            basic_fixture("u", &format!("prefix{PLACEHOLDER}"))
+            basic_fixture(placeholder(), &credentials::ascii(6))
         ),
         format!(
             "Basic {}",
-            basic_fixture("u", &format!("{PLACEHOLDER}{BODY_PLACEHOLDER}"))
+            basic_fixture(
+                "u",
+                &format!(
+                    "prefix{token_placeholder}",
+                    token_placeholder = placeholder()
+                )
+            )
         ),
-        format!("Basic {}", "A".repeat(8193)),
+        format!(
+            "Basic {}",
+            basic_fixture(
+                "u",
+                &format!(
+                    "{token_placeholder}{body_marker}",
+                    token_placeholder = placeholder(),
+                    body_marker = body_placeholder()
+                )
+            )
+        ),
+        format!("Basic {}", credentials::ascii(8193)),
     ] {
         let (status, _, body) = basic_exchange(&mut session, basic_request("/echo", &auth)).await;
         assert!(
             status == StatusCode::BAD_REQUEST
                 || status == StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
         );
-        assert!(!String::from_utf8_lossy(&body).contains(PLACEHOLDER));
+        assert!(!String::from_utf8_lossy(&body).contains(placeholder()));
         assert!(w.received().is_empty());
     }
     for nominated in [false, true] {
         let mut request = basic_request(
             "/echo",
-            &format!("Basic {}", basic_fixture("u", PLACEHOLDER)),
+            &format!("Basic {}", basic_fixture("u", placeholder())),
         );
         if nominated {
             request.headers_mut().insert(
@@ -262,7 +285,11 @@ async fn basic_transport_refuses_shapes_framing_duplicates_and_bad_values_before
         } else {
             request.headers_mut().append(
                 "authorization",
-                HeaderValueForFixture::from_static("Basic dTpw"),
+                HeaderValueForFixture::from_str(&format!(
+                    "Basic {}",
+                    basic_fixture("u", &credentials::ascii(16))
+                ))
+                .unwrap(),
             );
         }
         assert_eq!(
@@ -271,12 +298,17 @@ async fn basic_transport_refuses_shapes_framing_duplicates_and_bad_values_before
         );
         assert!(w.received().is_empty());
     }
-    for value in ["", "invalid\nsecret", "\u{007f}", &"x".repeat(6144)] {
+    for value in [
+        String::new(),
+        format!("{}\n", credentials::ascii(16)),
+        format!("{}\u{007f}", credentials::ascii(16)),
+        credentials::ascii(6144),
+    ] {
         w.api.config.lock().unwrap()["secrets"][0]["value"] = json!(value);
         w.config.refresh().await.unwrap();
         let request = basic_request(
             "/echo",
-            &format!("Basic {}", basic_fixture("u", PLACEHOLDER)),
+            &format!("Basic {}", basic_fixture("u", placeholder())),
         );
         assert_eq!(
             basic_exchange(&mut session, request).await.0,
@@ -297,15 +329,17 @@ async fn basic_transport_opaque_credentials_skip_generic_rewrite_and_keep_other_
     w.api.config.lock().unwrap()["secrets"][0]["placeholder"] = json!("T");
     w.config.refresh().await.unwrap();
     let mut session = basic_session(&w).await;
-    let mut request = basic_request("/echo", "bAsIc dTpw");
+    let ordinary = format!("bAsIc {}", basic_fixture("u", &credentials::ascii(16)));
+    assert!(ordinary.contains('T')); // The public username fixes this encoded prefix.
+    let mut request = basic_request("/echo", &ordinary);
     request
         .headers_mut()
         .insert("x-literal-control", HeaderValueForFixture::from_static("T"));
     let (status, _, _) = basic_exchange(&mut session, request).await;
     assert_eq!(status, StatusCode::OK);
     let got = w.received();
-    assert_eq!(got[0].headers["authorization"], "bAsIc dTpw");
-    assert_eq!(got[0].headers["x-literal-control"], SECRET);
+    assert_eq!(got[0].headers["authorization"], ordinary);
+    assert_eq!(got[0].headers["x-literal-control"], token_secret());
 }
 
 #[tokio::test]
@@ -323,9 +357,9 @@ async fn basic_transport_denials_no_match_and_no_automatic_token_realm() {
         *w.api.config.lock().unwrap() = config;
         w.config.refresh().await.unwrap();
         let placeholder = if deny == "other" {
-            OTHER_PLACEHOLDER
+            other_placeholder()
         } else {
-            PLACEHOLDER
+            placeholder()
         };
         let auth = format!("Basic {}", basic_fixture("u", placeholder));
         assert_eq!(
@@ -338,7 +372,7 @@ async fn basic_transport_denials_no_match_and_no_automatic_token_realm() {
     }
     *w.api.config.lock().unwrap() = team_config();
     w.config.refresh().await.unwrap();
-    let auth = format!("Basic {}", basic_fixture("u", PLACEHOLDER));
+    let auth = format!("Basic {}", basic_fixture("u", placeholder()));
     let before = w.received().len();
     let (status, headers, _) = basic_exchange(
         &mut session,
@@ -362,7 +396,7 @@ async fn basic_transport_denials_no_match_and_no_automatic_token_realm() {
 #[tokio::test]
 async fn basic_transport_inflight_rotation_and_next_request_revocation() {
     let w = world().await;
-    let auth = format!("Basic {}", basic_fixture("u", PLACEHOLDER));
+    let auth = format!("Basic {}", basic_fixture("u", placeholder()));
     let mut session = basic_session(&w).await;
     let response = tokio::time::timeout(
         Duration::from_secs(5),
@@ -373,17 +407,18 @@ async fn basic_transport_inflight_rotation_and_next_request_revocation() {
     .await
     .unwrap()
     .unwrap();
-    w.api.config.lock().unwrap()["secrets"][0]["value"] = json!("rotated-secret");
+    let rotated = credentials::ascii(14);
+    w.api.config.lock().unwrap()["secrets"][0]["value"] = json!(rotated);
     w.config.refresh().await.unwrap();
     w.dest.go_on.notify_one();
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    assert!(!String::from_utf8_lossy(&body).contains(SECRET));
-    assert!(!String::from_utf8_lossy(&body).contains(&basic_fixture("u", SECRET)));
-    assert!(String::from_utf8_lossy(&body).contains(PLACEHOLDER));
+    assert!(!String::from_utf8_lossy(&body).contains(token_secret()));
+    assert!(!String::from_utf8_lossy(&body).contains(&basic_fixture("u", token_secret())));
+    assert!(String::from_utf8_lossy(&body).contains(placeholder()));
     basic_exchange(&mut session, basic_request("/echo", &auth)).await;
     assert_eq!(
         w.received().last().unwrap().headers["authorization"],
-        format!("Basic {}", basic_fixture("u", "rotated-secret"))
+        format!("Basic {}", basic_fixture("u", &rotated))
     );
     w.api.config.lock().unwrap()["briqs"][0]["secrets"] = json!(["BODY"]);
     w.config.refresh().await.unwrap();
@@ -400,22 +435,22 @@ async fn basic_transport_audit_deduplicates_basic_literal_body_and_flush_retry()
     let mut session = basic_session(&w).await;
     let mut request = basic_request(
         "/echo",
-        &format!("Basic {}", basic_fixture("audit-user", PLACEHOLDER)),
+        &format!("Basic {}", basic_fixture("audit-user", placeholder())),
     );
     request.headers_mut().insert(
         "x-literal-control",
-        HeaderValueForFixture::from_static(PLACEHOLDER),
+        HeaderValueForFixture::from_static(placeholder()),
     );
-    *request.body_mut() = full(PLACEHOLDER);
+    *request.body_mut() = full(placeholder());
     basic_exchange(&mut session, request).await;
-    assert_eq!(w.received()[0].body, SECRET.as_bytes());
+    assert_eq!(w.received()[0].body, token_secret().as_bytes());
     w.events.flush().await;
     assert!(w.api.events.lock().unwrap().is_empty());
     w.api.events_down.store(false, Ordering::SeqCst);
     basic_audit_once(
         &w,
         "TOKEN",
-        &basic_fixture("audit-user", SECRET),
+        &basic_fixture("audit-user", token_secret()),
         "audit-user",
     )
     .await;
@@ -424,7 +459,7 @@ async fn basic_transport_audit_deduplicates_basic_literal_body_and_flush_retry()
 #[tokio::test]
 async fn basic_transport_budget_refuses_before_forward_and_releases_response_owner() {
     let w = world_budget(300 * 1024).await;
-    let auth = format!("Basic {}", basic_fixture("u", PLACEHOLDER));
+    let auth = format!("Basic {}", basic_fixture("u", placeholder()));
     let mut first = basic_session(&w).await;
     let response = first
         .send
@@ -460,7 +495,7 @@ async fn basic_transport_budget_refuses_before_forward_and_releases_response_own
 async fn basic_transport_mixed_case_duplicate_definitions_and_expanded_header_cap() {
     let w = world().await;
     let mut session = basic_session(&w).await;
-    let auth = format!("bAsIc {}", basic_fixture("public-user", PLACEHOLDER));
+    let auth = format!("bAsIc {}", basic_fixture("public-user", placeholder()));
     assert_eq!(
         basic_exchange(&mut session, basic_request("/echo", &auth))
             .await
@@ -469,7 +504,7 @@ async fn basic_transport_mixed_case_duplicate_definitions_and_expanded_header_ca
     );
     assert_eq!(
         w.received()[0].headers["authorization"],
-        format!("Basic {}", basic_fixture("public-user", SECRET))
+        format!("Basic {}", basic_fixture("public-user", token_secret()))
     );
     let mut config = team_config();
     let mut duplicate = config["secrets"][0].clone();
@@ -489,7 +524,7 @@ async fn basic_transport_mixed_case_duplicate_definitions_and_expanded_header_ca
     );
     assert_eq!(w.received().len(), 1);
     let mut config = team_config();
-    config["secrets"][0]["value"] = json!("x".repeat(5900));
+    config["secrets"][0]["value"] = json!(credentials::ascii(5900));
     *w.api.config.lock().unwrap() = config;
     w.config.refresh().await.unwrap();
     let mut request = basic_request("/echo", &auth);
@@ -511,7 +546,7 @@ async fn basic_transport_mixed_case_duplicate_definitions_and_expanded_header_ca
 #[tokio::test]
 async fn basic_transport_unsupported_and_broken_codings_never_expose_aliases() {
     let w = world().await;
-    let auth = format!("Basic {}", basic_fixture("u", PLACEHOLDER));
+    let auth = format!("Basic {}", basic_fixture("u", placeholder()));
     let mut session = basic_session(&w).await;
     for coding in ["br", "contradictory"] {
         let mut request = basic_request("/basic-variants", &auth);
@@ -521,8 +556,8 @@ async fn basic_transport_unsupported_and_broken_codings_never_expose_aliases() {
         );
         let (status, _, body) = basic_exchange(&mut session, request).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert!(!String::from_utf8_lossy(&body).contains(SECRET));
-        assert!(!String::from_utf8_lossy(&body).contains(&basic_fixture("u", SECRET)));
+        assert!(!String::from_utf8_lossy(&body).contains(token_secret()));
+        assert!(!String::from_utf8_lossy(&body).contains(&basic_fixture("u", token_secret())));
     }
     let mut request = basic_request("/basic-variants", &auth);
     request.headers_mut().insert(
@@ -551,8 +586,8 @@ async fn basic_transport_unsupported_and_broken_codings_never_expose_aliases() {
             failed,
             "truncated gzip must not be reported as a successful complete response"
         );
-        assert!(!String::from_utf8_lossy(&received).contains(SECRET));
-        assert!(!String::from_utf8_lossy(&received).contains(&basic_fixture("u", SECRET)));
+        assert!(!String::from_utf8_lossy(&received).contains(token_secret()));
+        assert!(!String::from_utf8_lossy(&received).contains(&basic_fixture("u", token_secret())));
     })
     .await
     .expect("broken fixture exceeded bound");
@@ -561,11 +596,11 @@ async fn basic_transport_unsupported_and_broken_codings_never_expose_aliases() {
 #[tokio::test]
 async fn basic_transport_exact_alias_wins_an_identical_literal_value_rule() {
     let w = world().await;
-    let emitted = basic_fixture("public", SECRET);
+    let emitted = basic_fixture("public", token_secret());
     w.api.config.lock().unwrap()["secrets"][1]["value"] = json!(emitted);
     w.config.refresh().await.unwrap();
     let mut session = basic_session(&w).await;
-    let original = format!("Basic {}", basic_fixture("public", PLACEHOLDER));
+    let original = format!("Basic {}", basic_fixture("public", placeholder()));
     let (_, headers, body) = basic_exchange(&mut session, basic_request("/echo", &original)).await;
     assert_eq!(headers["x-echo-auth"], original);
     assert!(String::from_utf8_lossy(&body).contains(&original));
