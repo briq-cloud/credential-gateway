@@ -41,12 +41,56 @@ jobs:
           context: .
           platforms: linux/${{ matrix.arch }}
           push: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          outputs: ${{ github.event_name == 'pull_request' && format('type=oci,dest={0}/gateway-{1}.oci.tar', runner.temp, matrix.arch) || '' }}
           provenance: false
           tags: ghcr.io/briq-cloud/credential-gateway:${{ steps.sha.outputs.short }}-${{ matrix.arch }}
           cache-from: |
             type=gha,scope=credential-gateway-${{ matrix.arch }}
             type=gha
           cache-to: type=gha,scope=credential-gateway-${{ matrix.arch }},mode=max
+      - name: Record pull request image source
+        if: github.event_name == 'pull_request'
+        env:
+          IMAGE_ARCH: ${{ matrix.arch }}
+          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess
+          root = pathlib.Path.cwd()
+          arch = os.environ['IMAGE_ARCH']
+          assert arch in ('amd64', 'arm64')
+          revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          head = os.environ['HEAD_REVISION']
+          assert all(re.fullmatch('[a-f0-9]{40}', value) for value in (revision, head))
+          names = subprocess.check_output([
+              'git', 'ls-files', '-z', '--', 'src', 'Cargo.toml', 'Cargo.lock', 'Dockerfile'
+          ]).decode().strip('\0').split('\0')
+          files = {}
+          for name in names:
+              path = root / name
+              assert path.resolve() == path and path.is_file() and path.stat().st_size < 4 * 1024**2
+              value = path.read_bytes()
+              files[name] = {'bytes': len(value), 'sha256': hashlib.sha256(value).hexdigest()}
+          image = pathlib.Path(os.environ['RUNNER_TEMP']) / f'gateway-{arch}.oci.tar'
+          with image.open('rb') as stream:
+              image_sha = hashlib.file_digest(stream, 'sha256').hexdigest()
+          proof = {'schema': 'credential-gateway.pr-image.v1', 'architecture': arch,
+                   'checkoutRevision': revision, 'headRevision': head,
+                   'runID': os.environ['GITHUB_RUN_ID'], 'files': files,
+                   'imageBytes': image.stat().st_size, 'imageSHA256': image_sha}
+          image.with_name(f'gateway-{arch}.source.json').write_text(
+              json.dumps(proof, indent=2, sort_keys=True) + '\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request'
+        with:
+          name: gateway-oci-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/gateway-${{ matrix.arch }}.oci.tar
+            ${{ runner.temp }}/gateway-${{ matrix.arch }}.source.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
       - name: Record published digest
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         env:
