@@ -155,6 +155,18 @@ async fn destination(dir: &Path) -> Destination {
                 .header("x-echo-auth", auth.clone().unwrap_or_default())
                 .header("content-type", "application/json");
             match parts.uri.path() {
+                "/basic-variants" | "/basic-delayed" | "/basic-bearer-challenge" =>
+                    basic_fixture_response(&parts, auth.as_deref(), go.clone()),
+                // An empty smart-HTTP repository; Git must negotiate Basic before refs.
+                "/git/repository.git/info/refs" if auth.is_none() => res
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("www-authenticate", "Basic realm=\"fixture\"")
+                    .body(full(""))
+                    .unwrap(),
+                "/git/repository.git/info/refs" => res
+                    .header("content-type", "application/x-git-upload-pack-advertisement")
+                    .body(full("001e# service=git-upload-pack\n00000000"))
+                    .unwrap(),
                 // Server-sent events: one, then a pause until the test says, then two.
                 "/stream" => {
                     let go = go.clone();

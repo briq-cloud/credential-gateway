@@ -125,3 +125,17 @@ async fn supported_codings_still_scrub_plaintext_including_duplicate_identity_me
     headers.append(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
     assert!(response_encoding(&headers).is_err());
 }
+
+#[tokio::test]
+async fn deflate_sniffing_preserves_two_header_bytes_across_one_byte_frames() {
+    for coding in ["deflate", "raw-deflate"] {
+        let payload = b"a fragmented compressed response";
+        let frames = compress(payload, coding)
+            .into_iter()
+            .map(|byte| Ok::<_, io::Error>(Frame::data(Bytes::from(vec![byte]))));
+        let body = StreamBody::new(futures_util::stream::iter(frames));
+        let decoded = decoded(body, "deflate").await.unwrap();
+        let output = decoded.collect().await.unwrap().to_bytes();
+        assert_eq!(output.as_ref(), payload);
+    }
+}

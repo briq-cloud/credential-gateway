@@ -87,6 +87,39 @@ owner disappears; failures before forwarding do not invent secret use.
   sent is a host that can return the value.
 - A briq can bypass the proxy; it then carries only placeholders, which are worthless without it.
 
+## HTTP Basic credentials
+
+On intercepted HTTPS requests, `Authorization: Basic` supports a public username and a password
+that is exactly one authorized header-secret placeholder. The gateway decodes that pair, replaces
+only the password, and re-encodes it. Git's username/password HTTP flow works with this form.
+Username placeholders, partial password substitutions and ambiguous placeholder definitions are
+refused. Ordinary Basic credentials with no applicable placeholder remain byte-identical.
+
+The scheme is case-insensitive and takes exactly one space followed by canonical padded standard
+base64. The token is at most 8 KiB; the decoded and expanded pair at most 6 KiB. Usernames are
+1–256 printable ASCII bytes without whitespace or colon. Real passwords must be nonempty and
+contain no ASCII controls; colons and UTF-8 are allowed. Duplicate Authorization fields and
+Connection nominations of Authorization are refused. The full rewritten header block still has
+its 64 KiB cap. Proxy authentication, cookies, URI userinfo and arbitrary encoded JSON/body fields
+are not decoded by this feature.
+
+Before forwarding, one combined response matcher covers literal configured values and up to four
+exact aliases of the emitted username/password pair: standard and URL-safe base64, each with and
+without padding. Headers and decoded streaming bodies use that matcher; response trailers remain
+dropped. This covers an echoed Basic token or a JSON `auth` field containing it. It does not cover
+arbitrary transformations, separately encoded password fragments or newly issued bearer tokens.
+Each Basic request first reserves 64 KiB of parser scratch from the existing rewrite budget;
+encoded aliases, matcher construction and retention are separately estimated before allocation.
+Admission exhaustion returns 503 before credentials are forwarded. No request-local aliases are
+cached across requests, and audit records the selected secret name once per request.
+
+A Docker `config.json` `auth` field is a client-side container, not something the gateway reads
+or edits. If its public-username/placeholder-password pair becomes an origin Basic request, the
+same transport applies. This does **not** establish general Docker login/pull/push support:
+registry bearer challenges and delegated-token containment remain separate work. A challenge
+realm or redirect never grants another host access, and the gateway fetches no token itself.
+No Docker daemon authentication envelope or credential helper is rewritten.
+
 ## Configuration
 
 | Variable | What |

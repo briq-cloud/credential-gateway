@@ -10,3 +10,7 @@ include!("gateway/scenarios/config_and_streaming.rs");
 include!("gateway/scenarios/admission_and_budgets.rs");
 
 include!("gateway/scenarios/encoding_bounds.rs");
+
+include!("gateway/scenarios/auth_contract.rs");
+
+include!("gateway/scenarios/basic_transport.rs");

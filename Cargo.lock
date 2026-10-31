@@ -196,6 +196,7 @@ version = "0.2.0"
 dependencies = [
  "aho-corasick",
  "async-compression",
+ "base64",
  "bytes",
  "flate2",
  "futures-util",

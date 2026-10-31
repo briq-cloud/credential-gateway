@@ -65,11 +65,15 @@ struct Matcher {
 
 impl Matcher {
     fn add(&mut self, from: &str, to: &str) -> Option<()> {
-        if from.is_empty() {
+        self.add_lengths(from.len(), to.len())
+    }
+
+    fn add_lengths(&mut self, from: usize, to: usize) -> Option<()> {
+        if from == 0 {
             return Some(());
         }
-        self.patterns = self.patterns.checked_add(from.len())?;
-        self.copies = self.copies.checked_add(from.len())?.checked_add(to.len())?;
+        self.patterns = self.patterns.checked_add(from)?;
+        self.copies = self.copies.checked_add(from)?.checked_add(to)?;
         self.rules = self.rules.checked_add(1)?;
         Some(())
     }
@@ -90,6 +94,31 @@ impl Matcher {
             .checked_add(self.copies)?
             .checked_add(self.rules.checked_mul(2 * std::mem::size_of::<Vec<u8>>())?)
     }
+}
+
+/// Four worst-case wire aliases, including construction/retention overlap and pair/header
+/// buffers. The aliases join the response matcher; this deliberately overcharges its fixed
+/// overhead instead of pretending a second uncharged matcher is free.
+pub(crate) fn basic_aliases(pair: usize, original_pair: usize) -> Option<usize> {
+    let from = pair.checked_add(2)?.checked_div(3)?.checked_mul(4)?;
+    let to = original_pair
+        .checked_add(2)?
+        .checked_div(3)?
+        .checked_mul(4)?;
+    let mut matcher = Matcher::default();
+    for _ in 0..4 {
+        matcher.add_lengths(from, to)?;
+    }
+    matcher
+        .estimated()?
+        .checked_add(from.checked_add(to)?.checked_mul(8)?)?
+        .checked_add(
+            4 * (std::mem::size_of::<(Vec<u8>, Vec<u8>)>()
+                + 2 * std::mem::size_of::<(&[u8], &[u8])>()),
+        )?
+        .checked_add(pair)?
+        .checked_add(original_pair)?
+        .checked_add(from.checked_add(6)?.checked_mul(2)?)
 }
 
 /// All three possible matchers and the deep-cloned request config, before either is built.
