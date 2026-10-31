@@ -2,6 +2,7 @@
 
 pub mod log;
 
+mod basic;
 pub mod budget;
 mod retained;
 

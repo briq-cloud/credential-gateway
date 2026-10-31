@@ -27,13 +27,68 @@ use tokio::process::Command;
 use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
 
-const SECRET: &str = "real-secret-VALUE-0123456789";
-const PLACEHOLDER: &str = "briq_secret_a1b2c3d4e5f6a7b8";
-const BODY_SECRET: &str = "body-secret-VALUE-9876543210";
-const BODY_PLACEHOLDER: &str = "briq_secret_ffffffffeeeeeeee";
-const OTHER_PLACEHOLDER: &str = "briq_secret_0000000011111111";
-const OWN_SECRET: &str = "own-secret-VALUE-5555555555";
-const OWN_PLACEHOLDER: &str = "briq_secret_abcdefabcdefabcd";
+// One immutable set per test process lets the independent fake API, destination and
+// clients agree without fixed passwords or process-global environment mutation.
+struct FixtureCredentials {
+    token: String,
+    body: String,
+    own: String,
+    other: String,
+    api: String,
+    token_placeholder: String,
+    body_placeholder: String,
+    own_placeholder: String,
+    other_placeholder: String,
+}
+fn fixture_credentials() -> &'static FixtureCredentials {
+    static VALUES: std::sync::OnceLock<FixtureCredentials> = std::sync::OnceLock::new();
+    VALUES.get_or_init(|| FixtureCredentials {
+        token: credentials::ascii(28),
+        body: credentials::ascii(28),
+        own: credentials::ascii(27),
+        other: credentials::ascii(18),
+        api: credentials::ascii(32),
+        token_placeholder: format!("briq_secret_{}", credentials::ascii(16)),
+        body_placeholder: format!("briq_secret_{}", credentials::ascii(16)),
+        own_placeholder: format!("briq_secret_{}", credentials::ascii(16)),
+        other_placeholder: format!("briq_secret_{}", credentials::ascii(16)),
+    })
+}
+fn gateway_api_token() -> &'static str {
+    &fixture_credentials().api
+}
+fn token_secret() -> &'static str {
+    &fixture_credentials().token
+}
+fn body_secret() -> &'static str {
+    &fixture_credentials().body
+}
+fn own_secret() -> &'static str {
+    &fixture_credentials().own
+}
+fn placeholder() -> &'static str {
+    &fixture_credentials().token_placeholder
+}
+fn body_placeholder() -> &'static str {
+    &fixture_credentials().body_placeholder
+}
+fn own_placeholder() -> &'static str {
+    &fixture_credentials().own_placeholder
+}
+fn other_placeholder() -> &'static str {
+    &fixture_credentials().other_placeholder
+}
+
+fn fixture_curl() -> Command {
+    let mut command = Command::new("curl");
+    // --disable must be first: local fixtures must not load a user's curlrc, credentials,
+    // proxy settings, injected headers or tracing configuration.
+    command
+        .arg("--disable")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    command
+}
 
 type Body = UnsyncBoxBody<Bytes, BoxError>;
 
@@ -155,6 +210,22 @@ async fn destination(dir: &Path) -> Destination {
                 .header("x-echo-auth", auth.clone().unwrap_or_default())
                 .header("content-type", "application/json");
             match parts.uri.path() {
+                "/basic-variants" | "/basic-delayed" | "/basic-bearer-challenge" => {
+                    basic_fixture_response(&parts, auth.as_deref(), go.clone())
+                }
+                // An empty smart-HTTP repository; Git must negotiate Basic before refs.
+                "/git/repository.git/info/refs" if auth.is_none() => res
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("www-authenticate", "Basic realm=\"fixture\"")
+                    .body(full(""))
+                    .unwrap(),
+                "/git/repository.git/info/refs" => res
+                    .header(
+                        "content-type",
+                        "application/x-git-upload-pack-advertisement",
+                    )
+                    .body(full("001e# service=git-upload-pack\n00000000"))
+                    .unwrap(),
                 // Server-sent events: one, then a pause until the test says, then two.
                 "/stream" => {
                     let go = go.clone();
@@ -179,7 +250,7 @@ async fn destination(dir: &Path) -> Destination {
                     res.body(StreamBody::new(frames).boxed_unsync()).unwrap()
                 }
                 "/amplified-header" => res
-                    .header("x-expanded", "A".repeat(4096))
+                    .header("x-expanded", token_secret()[..1].repeat(4096))
                     .body(full("ok"))
                     .unwrap(),
                 // An upstream dies while echoing a secret across frames.
@@ -192,7 +263,7 @@ async fn destination(dir: &Path) -> Destination {
                                 0 => Some((
                                     Ok(Frame::data(Bytes::from(format!(
                                         "before {}",
-                                        &SECRET[..10]
+                                        &token_secret()[..10]
                                     )))),
                                     1,
                                 )),
@@ -210,7 +281,7 @@ async fn destination(dir: &Path) -> Destination {
                 }
                 // The real value echoed across two writes.
                 "/split" => {
-                    let (a, b) = SECRET.split_at(10);
+                    let (a, b) = token_secret().split_at(10);
                     let parts = vec![format!("before {a}"), format!("{b} after")];
                     let frames =
                         futures_util::stream::unfold(parts.into_iter(), |mut it| async move {
@@ -293,8 +364,9 @@ async fn fake_api(config: Value) -> (String, Arc<ApiState>) {
     let port = serve(None, move |req: Request<Incoming>| {
         let st = st.clone();
         async move {
+            let expected = format!("Bearer {}", gateway_api_token());
             let ok = req.headers().get("authorization").map(|v| v.as_bytes())
-                == Some(b"Bearer gw-token");
+                == Some(expected.as_bytes());
             let (method, path) = (req.method().clone(), req.uri().path().to_string());
             let body = req.into_body().collect().await.unwrap().to_bytes();
             let status = |s: StatusCode| Response::builder().status(s).body(full("")).unwrap();
@@ -344,17 +416,17 @@ async fn fake_api(config: Value) -> (String, Arc<ApiState>) {
 fn team_config() -> Value {
     json!({
         "secrets": [
-            { "name": "TOKEN", "placeholder": PLACEHOLDER, "value": SECRET, "hosts": ["localhost"], "locations": ["header"] },
-            { "name": "BODY", "placeholder": BODY_PLACEHOLDER, "value": BODY_SECRET, "hosts": ["localhost"], "locations": ["header", "body"] },
+            { "name": "TOKEN", "placeholder": placeholder(), "value": token_secret(), "hosts": ["localhost"], "locations": ["header"] },
+            { "name": "BODY", "placeholder": body_placeholder(), "value": body_secret(), "hosts": ["localhost"], "locations": ["header", "body"] },
             // A team secret for the same host that the test briq did not name.
-            { "name": "OTHER", "placeholder": OTHER_PLACEHOLDER, "value": "other-secret-VALUE", "hosts": ["localhost"], "locations": ["header"] },
+            { "name": "OTHER", "placeholder": other_placeholder(), "value": fixture_credentials().other, "hosts": ["localhost"], "locations": ["header"] },
         ],
         "briqs": [{
             "id": "bq_test",
             "host": "localhost",
             "secrets": ["TOKEN", "BODY"],
             // The briq's own secret with hosts: its value, for it alone.
-            "own": [{ "name": "OWN", "placeholder": OWN_PLACEHOLDER, "value": OWN_SECRET, "hosts": ["localhost"], "locations": ["header"] }],
+            "own": [{ "name": "OWN", "placeholder": own_placeholder(), "value": own_secret(), "hosts": ["localhost"], "locations": ["header"] }],
         }],
     })
 }
@@ -454,7 +526,7 @@ async fn world_resources(
         }
     }
     let ca = Ca::load_or_create(&ca_dir, "test team").unwrap();
-    let api = Arc::new(Api::new(&url, "gw-token"));
+    let api = Arc::new(Api::new(&url, gateway_api_token()));
     api.register_ca(&ca.cert_pem).await.unwrap();
     let ca_pem = dir.path().join("ca.pem");
     std::fs::write(&ca_pem, &ca.cert_pem).unwrap();
@@ -496,7 +568,7 @@ async fn world() -> World {
 impl World {
     async fn curl(&self, args: &[&str]) -> String {
         let proxy = format!("http://127.0.0.1:{}", self.proxy);
-        let out = Command::new("curl")
+        let out = fixture_curl()
             .args(["-sS", "-x", &proxy])
             .args(args)
             .output()

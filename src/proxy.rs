@@ -32,13 +32,15 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::BoxError;
+
+mod intercept;
 use crate::budget::{Budget, DEFAULT_REWRITE_BUDGET, estimate};
 use crate::ca::Leafs;
 use crate::config::{Config, Secret};
@@ -392,224 +394,6 @@ impl Gateway {
     }
 
     /// One request to an intercepted host.
-    async fn intercept(
-        &self,
-        req: Request<Incoming>,
-        host: &str,
-        port: u16,
-        briq: Option<&str>,
-        upstream: &Client<HttpsConnector<HttpConnector>, Body>,
-    ) -> Result<Response<Body>, BoxError> {
-        // The request must address the CONNECT host: a Host naming another site on the same
-        // address (a shared CDN) would carry the real value there. An absolute-form target is
-        // refused too.
-        let req_host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(|h| strip_port(h).to_ascii_lowercase());
-        if req_host.is_some_and(|h| h != host.to_ascii_lowercase()) || req.uri().scheme().is_some()
-        {
-            return Ok(text(
-                StatusCode::BAD_REQUEST,
-                &format!("briq credential gateway: the request must address {host}\n"),
-            ));
-        }
-        let mut audit_charge = Events::estimate(briq, host, req.method().as_str());
-        let (secrets, (reservation, audit)) =
-            match self.config.for_host_with(host, briq, |secrets| {
-                let reservation = {
-                    let mut selected = secrets.inspect(|secret| audit_charge.name(&secret.name));
-                    estimate(&mut selected)
-                        .and_then(|bytes| self.rewrite_budget.reserve(bytes))
-                        .ok_or(())?
-                };
-                let audit = self
-                    .events
-                    .admit_estimated(briq, host, req.method().as_str(), audit_charge)
-                    .map_err(|_| ())?;
-                Ok::<_, ()>((reservation, audit))
-            }) {
-                Ok(admitted) => admitted,
-                Err(()) => {
-                    return Ok(text(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "credential gateway capacity exceeded\n",
-                    ));
-                }
-            };
-        let (parts, body) = req.into_parts();
-        let mut headers = forward_headers(&parts.headers);
-        headers.insert(header::HOST, HeaderValue::from_str(&bracketed(host))?);
-        // Scrubbing reads the response: ask for it uncompressed.
-        headers.insert(
-            header::ACCEPT_ENCODING,
-            HeaderValue::from_static("identity"),
-        );
-
-        let mut used: Vec<String> = Vec::new();
-        // Headers: every secret that allows them.
-        let in_headers: Vec<&Secret> = secrets.iter().filter(|s| s.allows("header")).collect();
-        if let Some(r) = replacer(&in_headers, |s| (&s.placeholder, &s.value))? {
-            let hits = match rewrite_headers(&mut headers, &r) {
-                Ok(hits) => hits,
-                Err(_) => {
-                    return Ok(text(
-                        StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-                        "rewritten request headers exceed 64 KiB or contain invalid values\n",
-                    ));
-                }
-            };
-            used.extend(names(&in_headers, &hits));
-        }
-
-        // The body, for the secrets that allow it: held up to `max_body` to keep its length,
-        // rewritten as it streams past that. Without such a secret it goes on untouched.
-        let in_body: Vec<&Secret> = secrets.iter().filter(|s| s.allows("body")).collect();
-        let mut body_hits = None;
-        let mut held = None;
-        let body: Body = match replacer(&in_body, |s| (&s.placeholder, &s.value))? {
-            None => boxed(body),
-            Some(r) => {
-                let r = Arc::new(r);
-                let (head, rest) = match self.held.clone().try_acquire_owned() {
-                    Ok(permit) => {
-                        held = Some(Arc::new(permit));
-                        read_up_to(body, self.opts.max_body).await?
-                    }
-                    // As many bodies held as allowed: this one streams from its first byte.
-                    Err(_) => (BytesMut::new(), Some(body)),
-                };
-                match rest {
-                    None if r.replaced_len(&head, self.opts.max_body).is_some() => {
-                        let (out, hits) = r.replace_all(&head);
-                        used.extend(names(&in_body, &hits));
-                        // A request that had no body (a GET) is sent without one.
-                        let had_body = !out.is_empty()
-                            || parts.headers.contains_key(header::CONTENT_LENGTH)
-                            || parts.headers.contains_key(header::TRANSFER_ENCODING);
-                        if had_body {
-                            headers.insert(header::CONTENT_LENGTH, out.len().into());
-                        }
-                        full(out)
-                    }
-                    None => {
-                        // The input fits, but substitutions would exceed the output budget.
-                        headers.remove(header::CONTENT_LENGTH);
-                        let stream = Stream::new(r);
-                        body_hits = Some(stream.hits());
-                        Rewrite::new(full(head.freeze()), stream).boxed_unsync()
-                    }
-                    Some(rest) => {
-                        headers.remove(header::CONTENT_LENGTH);
-                        let stream = Stream::new(r);
-                        body_hits = Some(stream.hits());
-                        let chained = StreamBody::new(
-                            futures_util::stream::once(async move {
-                                Ok::<_, BoxError>(Frame::data(head.freeze()))
-                            })
-                            .chain(TryStreamExt::map_err(BodyStream::new(rest), BoxError::from)),
-                        );
-                        Rewrite::new(chained, stream).boxed_unsync()
-                    }
-                }
-            }
-        };
-
-        if let Some(audit) = &audit {
-            audit.used(used);
-            if let Some(hits) = &body_hits {
-                audit.body(
-                    hits.clone(),
-                    in_body.iter().map(|secret| secret.name.as_str()),
-                );
-            }
-        }
-        let port = self.opts.upstream_port.unwrap_or(port);
-        let path = parts
-            .uri
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/");
-        let mut up = Request::builder()
-            .method(parts.method.clone())
-            .uri(Uri::try_from(format!(
-                "https://{}:{port}{path}",
-                bracketed(host)
-            ))?)
-            .body(Retained::new(body, (reservation.clone(), held, audit.clone())).boxed_unsync())?;
-        *up.headers_mut() = headers;
-        if let Some(audit) = &audit {
-            audit.arm();
-        }
-        let res = upstream.request(up).await;
-        // A request that failed after forwarding began still carried the values.
-        let code = res
-            .as_ref()
-            .map_or(502, |response| response.status().as_u16());
-        if let Some(audit) = &audit {
-            audit.finish(code);
-        }
-        let res = res?;
-
-        // What comes back: a real value, if the destination echoes it, becomes the placeholder
-        // again, in headers and body. Every secret that applies to this request, used or not.
-        let Some(scrub) = replacer(&secrets.iter().collect::<Vec<_>>(), |s| {
-            (&s.value, &s.placeholder)
-        })?
-        else {
-            // No secret applies any more (revoked since the connection opened): nothing to
-            // scrub, the response goes on as it came.
-            let (p, b) = res.into_parts();
-            let mut out = Response::new(boxed(b));
-            *out.status_mut() = p.status;
-            *out.headers_mut() = forward_headers(&p.headers);
-            return Ok(out);
-        };
-        let scrub = Arc::new(scrub);
-        let (parts_res, body) = res.into_parts();
-        // Read original metadata: hop-by-hop filtering must not hide a coded body.
-        let encoding = match response_encoding(&parts_res.headers) {
-            Ok(encoding) => encoding,
-            Err(_) => return Ok(encoding_refusal()),
-        };
-        let mut out = Response::builder()
-            .status(parts_res.status)
-            .body(Empty::new().map_err(never).boxed_unsync())?;
-        let mut headers = forward_headers(&parts_res.headers);
-        rewrite_headers(&mut headers, &scrub)?;
-        let st = parts_res.status;
-        if parts.method == Method::HEAD
-            || st.is_informational()
-            || st == StatusCode::NO_CONTENT
-            || st == StatusCode::NOT_MODIFIED
-        {
-            *out.headers_mut() = headers;
-            return Ok(out);
-        }
-        // The length changes with what is replaced: the body goes out chunked.
-        headers.remove(header::CONTENT_LENGTH);
-        if encoding.is_none() {
-            headers.remove(header::CONTENT_ENCODING);
-        }
-        let body: Body = match encoding {
-            None => boxed(body),
-            // Asked for none, got a compressed body: read it to scrub it, or refuse it. A real
-            // value never goes on unread.
-            Some(enc) => match decoded(body, &enc).await {
-                Some(b) => {
-                    headers.remove(header::CONTENT_ENCODING);
-                    b
-                }
-                None => return Ok(encoding_refusal()),
-            },
-        };
-        *out.headers_mut() = headers;
-        *out.body_mut() =
-            Retained::new(Rewrite::new(body, Stream::new(scrub)), reservation).boxed_unsync();
-        Ok(out)
-    }
-
     async fn forward_plain(&self, req: Request<Incoming>) -> Response<Body> {
         let (parts, body) = req.into_parts();
         let host = parts
@@ -755,10 +539,13 @@ where
         }
         // A zlib stream, or raw deflate from servers that send that instead.
         "deflate" => {
-            let head = reader.fill_buf().await.ok()?;
-            let zlib = head.len() >= 2
-                && head[0] & 0x0f == 8
-                && ((u16::from(head[0]) << 8) | u16::from(head[1])) % 31 == 0;
+            // fill_buf may expose only one network frame. Read the two-byte signature
+            // completely, then prepend it without dropping or copying the remaining stream.
+            let mut head = [0; 2];
+            reader.read_exact(&mut head).await.ok()?;
+            let zlib =
+                head[0] & 0x0f == 8 && ((u16::from(head[0]) << 8) | u16::from(head[1])) % 31 == 0;
+            let reader = std::io::Cursor::new(head).chain(reader);
             if zlib {
                 Box::new(ZlibDecoder::new(reader))
             } else {
@@ -783,11 +570,23 @@ fn replacer<'a>(
 
 /// Check aggregate rewritten size before allocating any header output.
 fn rewrite_headers(headers: &mut HeaderMap, replacer: &Replacer) -> Result<Vec<bool>, BoxError> {
+    rewrite_headers_except_basic(headers, replacer, false)
+}
+
+fn rewrite_headers_except_basic(
+    headers: &mut HeaderMap,
+    replacer: &Replacer,
+    protect_basic: bool,
+) -> Result<Vec<bool>, BoxError> {
     let mut size = 2usize;
     for (name, value) in headers.iter() {
-        let len = replacer
-            .replaced_len(value.as_bytes(), MAX_HEADER_BYTES)
-            .ok_or("rewritten headers exceed 64 KiB")?;
+        let len = if protect_basic && name == header::AUTHORIZATION {
+            value.len()
+        } else {
+            replacer
+                .replaced_len(value.as_bytes(), MAX_HEADER_BYTES)
+                .ok_or("rewritten headers exceed 64 KiB")?
+        };
         size = size
             .checked_add(name.as_str().len())
             .and_then(|n| n.checked_add(4))
@@ -796,7 +595,10 @@ fn rewrite_headers(headers: &mut HeaderMap, replacer: &Replacer) -> Result<Vec<b
             .ok_or("rewritten headers exceed 64 KiB")?;
     }
     let mut hits = vec![false; replacer.patterns()];
-    for value in headers.values_mut() {
+    for (name, value) in headers.iter_mut() {
+        if protect_basic && name == header::AUTHORIZATION {
+            continue;
+        }
         let (out, matched) = replacer.replace_all(value.as_bytes());
         if matched.iter().any(|&hit| hit) {
             *value = HeaderValue::from_bytes(&out)?;
