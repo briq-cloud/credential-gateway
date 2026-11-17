@@ -10,8 +10,12 @@
 //!   GATEWAY_MAX_CONNECTIONS Maximum proxy sockets (1024; positive integer)
 //!   GATEWAY_REWRITE_BUDGET_MB Estimated matcher admission budget in MiB (64)
 //!   GATEWAY_LOG_LEVEL   debug, info (default), warn, error
+//!   BRIQ_EGRESS_POLICY  optional, JSON: the exact hostnames to forward to (see README, "Egress
+//!                       policy"); absent, the gateway is unrestricted; invalid, it does not start
 //!
 //! `credential-gateway health` asks a running gateway's /healthz: exit 0 when it answers.
+//! `credential-gateway policy-status <challenge>` asks a policy-restricted gateway, over its local
+//! socket, which policy it enforces.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,9 +23,12 @@ use std::time::Duration;
 
 use credential_gateway::ca::{Ca, Leafs};
 use credential_gateway::config::{Api, Config, dns};
+use credential_gateway::dialer::Dialer;
+use credential_gateway::egress::{Egress, EgressPolicy};
 use credential_gateway::events::Events;
 use credential_gateway::log;
 use credential_gateway::proxy::{Gateway, Options};
+use credential_gateway::status::{self, StatusSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
@@ -88,7 +95,17 @@ async fn main() {
     if std::env::args().nth(1).as_deref() == Some("health") {
         std::process::exit(if health(port()).await { 0 } else { 1 });
     }
+    if std::env::args().nth(1).as_deref() == Some("policy-status") {
+        std::process::exit(policy_status().await);
+    }
     log::set_level(&env("GATEWAY_LOG_LEVEL").unwrap_or_default());
+    let policy = match EgressPolicy::from_env() {
+        Ok(policy) => policy.map(Arc::new),
+        Err(err) => {
+            credential_gateway::log!(Error, "invalid egress policy", "err": err.to_string());
+            std::process::exit(2);
+        }
+    };
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (Some(api_url), Some(token)) = (env("BRIQ_API_URL"), env("BRIQ_GATEWAY_TOKEN")) else {
         credential_gateway::log!(Error, "BRIQ_API_URL and BRIQ_GATEWAY_TOKEN are required");
@@ -154,7 +171,11 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let gateway = Gateway::new(config, leafs, events.clone(), opts);
+    let egress = policy.clone().map(|policy| Egress {
+        policy,
+        dialer: Dialer::system(),
+    });
+    let gateway = Gateway::with_egress(config, leafs, events.clone(), opts, egress);
 
     let port = port();
     let listener = match TcpListener::bind(("::", port)).await {
@@ -164,8 +185,22 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    credential_gateway::log!(Info, "listening", "port": port);
+    let status_socket = match &policy {
+        None => None,
+        Some(_) => match StatusSocket::bind() {
+            Ok(socket) => Some(Arc::new(socket)),
+            Err(err) => {
+                credential_gateway::log!(Error, "cannot bind the policy status socket", "err": err.to_string());
+                std::process::exit(1);
+            }
+        },
+    };
+    credential_gateway::log!(Info, "listening", "port": port, "egress_policy": policy.is_some());
     let server = tokio::spawn(gateway.serve(listener));
+    if let (Some(socket), Some(policy)) = (&status_socket, &policy) {
+        let (socket, policy) = (socket.clone(), policy.clone());
+        tokio::spawn(async move { socket.serve(policy).await });
+    }
 
     let mut term = signal(SignalKind::terminate()).expect("a SIGTERM handler");
     tokio::select! {
@@ -174,6 +209,25 @@ async fn main() {
         _ = server => {}
     }
     events.flush().await;
+}
+
+/// The helper: the gateway's answer on stdout, or a fixed message and a non-zero exit.
+async fn policy_status() -> i32 {
+    let args: Vec<String> = std::env::args().collect();
+    let answer = match args.as_slice() {
+        [_, _, challenge] => status::ask(challenge).await,
+        _ => None,
+    };
+    match answer {
+        Some(line) => {
+            println!("{line}");
+            0
+        }
+        None => {
+            eprintln!("policy-status: unavailable");
+            1
+        }
+    }
 }
 
 async fn health(port: u16) -> bool {

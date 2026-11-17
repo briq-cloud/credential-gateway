@@ -42,6 +42,7 @@ use crate::BoxError;
 use crate::budget::{Budget, DEFAULT_REWRITE_BUDGET, estimate};
 use crate::ca::Leafs;
 use crate::config::{Config, Secret};
+use crate::egress::Egress;
 use crate::events::Events;
 use crate::retained::Retained;
 use crate::rewrite::{Replacer, Rewrite, Stream};
@@ -183,6 +184,9 @@ pub struct Gateway {
     leafs: Arc<Leafs>,
     events: Arc<Events>,
     opts: Options,
+    /// The birth hostname policy and its dialer; none is the unrestricted gateway.
+    egress: Option<Egress>,
+    tls: rustls::ClientConfig,
     upstream_connector: HttpsConnector<HttpConnector>,
     plain: Client<HttpConnector, Body>,
 }
@@ -193,6 +197,18 @@ impl Gateway {
         leafs: Arc<Leafs>,
         events: Arc<Events>,
         opts: Options,
+    ) -> Arc<Self> {
+        Self::with_egress(config, leafs, events, opts, None)
+    }
+
+    /// A gateway that, given an egress policy, forwards only what it authorizes (see
+    /// `restricted`); without one it is exactly the unrestricted gateway.
+    pub fn with_egress(
+        config: Arc<Config>,
+        leafs: Arc<Leafs>,
+        events: Arc<Events>,
+        opts: Options,
+        egress: Option<Egress>,
     ) -> Arc<Self> {
         let mut roots = RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
@@ -211,7 +227,7 @@ impl Gateway {
         http.enforce_http(false);
         http.set_connect_timeout(Some(Duration::from_secs(10)));
         let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls)
+            .with_tls_config(tls.clone())
             .https_only()
             .enable_http1()
             .wrap_connector(http.clone());
@@ -226,6 +242,8 @@ impl Gateway {
             leafs,
             events,
             opts,
+            egress,
+            tls,
             upstream_connector: https,
             plain: Client::builder(TokioExecutor::new())
                 .pool_max_idle_per_host(0)
@@ -294,6 +312,9 @@ impl Gateway {
         if req.uri().path() == "/healthz" && req.uri().scheme().is_none() {
             return text(StatusCode::OK, "ok\n");
         }
+        if self.egress.is_some() {
+            return restricted::refusal(StatusCode::FORBIDDEN);
+        }
         // Plain HTTP through the proxy: forwarded, never injected.
         match req.uri().scheme_str() {
             Some("http") => self.forward_plain(req).await,
@@ -309,6 +330,9 @@ impl Gateway {
     }
 
     async fn connect(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
+        if self.egress.is_some() {
+            return self.connect_restricted(req, peer).await;
+        }
         let Some(auth) = req.uri().authority().cloned() else {
             return status(StatusCode::BAD_REQUEST);
         };
@@ -392,14 +416,17 @@ impl Gateway {
     }
 
     /// One request to an intercepted host.
-    async fn intercept(
+    async fn intercept<C>(
         &self,
         req: Request<Incoming>,
         host: &str,
         port: u16,
         briq: Option<&str>,
-        upstream: &Client<HttpsConnector<HttpConnector>, Body>,
-    ) -> Result<Response<Body>, BoxError> {
+        upstream: &Client<C, Body>,
+    ) -> Result<Response<Body>, BoxError>
+    where
+        C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+    {
         // The request must address the CONNECT host: a Host naming another site on the same
         // address (a shared CDN) would carry the real value there. An absolute-form target is
         // refused too.
@@ -525,7 +552,10 @@ impl Gateway {
                 );
             }
         }
-        let port = self.opts.upstream_port.unwrap_or(port);
+        let port = match self.egress {
+            Some(_) => port,
+            None => self.opts.upstream_port.unwrap_or(port),
+        };
         let path = parts
             .uri
             .path_and_query()
@@ -871,6 +901,8 @@ fn text(code: StatusCode, body: &str) -> Response<Body> {
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
     r
 }
+
+mod restricted;
 
 #[cfg(test)]
 #[path = "proxy/encoding_tests.rs"]
