@@ -99,7 +99,7 @@ refresh, and not when the API cannot be reached. A different policy needs a new 
 ```
 
 - The three identifiers are non-empty ASCII strings of at most 128 characters from
-  `A-Z a-z 0-9 . _ : -`. Every field is required and unknown fields are refused.
+  `A-Z a-z 0-9 _ -`. Every field is required and unknown fields are refused.
 - A host is an exact ASCII DNS name: at least two labels, each 1–63 letters, digits or inner
   hyphens, 253 bytes in all, a last label that is not a number (so no IP in any notation). No
   wildcard, port, scheme, space, trailing dot or non-ASCII character. Hosts are lowercased, sorted
