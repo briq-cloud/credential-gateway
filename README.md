@@ -87,6 +87,72 @@ owner disappears; failures before forwarding do not invent secret use.
   sent is a host that can return the value.
 - A briq can bypass the proxy; it then carries only placeholders, which are worthless without it.
 
+## Egress policy
+
+Optional and off by default: a gateway without `BRIQ_EGRESS_POLICY` behaves exactly as described
+above. With it, the gateway forwards HTTPS to a fixed list of exact hostnames and nothing else.
+The policy is read once at start and never changes while the process runs: not by a config
+refresh, and not when the API cannot be reached. A different policy needs a new gateway.
+
+```json
+{"policy_format":1,"namespace":"…","team_id":"…","briq_id":"…","hosts":["api.example.com"]}
+```
+
+- The three identifiers are non-empty ASCII strings of at most 128 characters from
+  `A-Z a-z 0-9 _ -`. Every field is required and unknown fields are refused.
+- A host is an exact ASCII DNS name: at least two labels, each 1–63 letters, digits or inner
+  hyphens, 253 bytes in all, a last label that is not a number (so no IP in any notation). No
+  wildcard, port, scheme, space, trailing dot or non-ASCII character. Hosts are lowercased, sorted
+  and deduplicated; at most 100 may be given, and an empty list denies everything.
+- An invalid value (an empty one included) stops the gateway at start, before it registers its CA
+  or opens a port. The error names the rule broken, never the value.
+- The digest is the SHA-256 of the compact JSON of the canonical policy, its keys in the order
+  above and its hosts normalized: `sha256:<64 lowercase hex>`. The binding the gateway reports is
+  `{"policy_format":1,"policy_digest":"sha256:…","enforcement_version":1}`.
+
+**What a restricted gateway does.** It serves a CONNECT to a listed host on port 443 and every
+such CONNECT is intercepted, with or without secrets, using the gateway's CA: clients must trust
+it. Everything else is refused with 403: other ports, hosts not listed, IP literals, plain HTTP
+through the proxy, and raw tunnels. The policy applies to every client, including addresses the
+gateway does not know and briqs with no secret; which secrets are put in remains decided by the
+API's config, unchanged.
+
+Inside the session each request must be HTTP/1.1 in origin form, with exactly one `Host` that is
+the CONNECT name (`:443` may be written), and no `Upgrade`, WebSocket or nested CONNECT; the TLS
+server name in the client's hello must be the CONNECT name too (a client that sends none is
+refused). A request that fails these is refused and the connection closed. The gateway never
+follows a redirect: a `Location` goes back to the client, and following it is a new CONNECT that
+the policy decides again.
+
+**How it dials.** The host is authorized before any lookup. It is then resolved once (5-second
+deadline) per CONNECT session. An empty answer is refused, and so is the whole answer if any
+address in it is not public: the gateway dials only global unicast addresses, and only those
+literals, never a name, for the life of the session, with the TLS server name and `Host` fixed to
+the authorized name. A name that changes its answer after validation is not followed.
+Not public: IPv4 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24, 192.0.2/24,
+192.88.99/24, 192.168/16, 198.18/15, 198.51.100/24, 203.0.113/24, 224/4 and 240/4; every IPv6
+address outside 2000::/3, and inside it 2001::/23 (including Teredo), 2001:db8::/32, 2002::/16
+(6to4) and 3fff::/20. IPv4-mapped, translation (NAT64), unique-local, link-local and multicast
+addresses fall outside 2000::/3.
+
+**Reporting the policy.** A restricted gateway, and only one, listens on a Unix socket,
+`/run/credential-gateway/policy.sock` (directory mode 0700, socket 0600, peers of another user
+refused), once its proxy port is bound. The command
+
+```
+credential-gateway policy-status <64 lowercase hex characters>
+```
+
+asks it and prints one line: `{"challenge":"…","policy_format":1,"policy_digest":"sha256:…",
+"enforcement_version":1,"ready":true}`, built from the policy the gateway forwards with. It takes
+exactly that one argument, ignores the environment, gives up after two seconds, and on any failure
+exits non-zero printing only `policy-status: unavailable`. An unrestricted gateway has no such
+socket, so the command fails for it. The socket path is fixed.
+
+Limits: HTTPS on port 443 only, HTTP/1.1 only, exact names only. This restricts what the gateway
+forwards; it does not stop a briq from bypassing the proxy, which the network around it has to
+enforce.
+
 ## Configuration
 
 | Variable | What |
@@ -103,6 +169,7 @@ owner disappears; failures before forwarding do not invent secret use.
 | `GATEWAY_REWRITE_BUDGET_MB` | Global estimated matcher construction/retention budget in MiB: 64; positive integer |
 | `GATEWAY_MAX_CONFIG_MB` | Maximum control-API response body in MiB: 8; positive integer |
 | `GATEWAY_LOG_LEVEL` | `debug`, `info` (default), `warn`, `error` |
+| `BRIQ_EGRESS_POLICY` | Optional: the hostname policy above. Absent: unrestricted. Invalid: the gateway does not start |
 
 `credential-gateway health` asks the running gateway's `/healthz` and exits 0 when it answers
 (the image's `HEALTHCHECK`). Logs are one JSON line per event: `ts`, `level`, `message`, fields.

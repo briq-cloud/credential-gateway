@@ -21,6 +21,7 @@ libc = "0.2"
 pem = "4"
 pin-project-lite = "0.2"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
+ring = { version = "0.17", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
@@ -29,6 +30,7 @@ time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["io"] }
+tower-service = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 webpki-roots = "1"
 x509-parser = "0.18"
